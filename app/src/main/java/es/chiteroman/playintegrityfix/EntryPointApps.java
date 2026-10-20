@@ -23,9 +23,12 @@ public final class EntryPointApps {
         }
         verboseLogs = logLevel;
         map.clear();
+        LOG("Starting per-app profile injection; Android API=" + Build.VERSION.SDK_INT
+                + ", log level=" + verboseLogs);
         receiveJson(data);
+        LOG("Parsed " + map.size() + " profile Build fields");
         applyProfileEnvironment();
-        if (verboseLogs > 99) logFields();
+        if (verboseLogs > 2) logFields();
         spoofDevice();
     }
 
@@ -65,16 +68,30 @@ public final class EntryPointApps {
     }
 
     static void spoofDevice() {
-        for (String key : map.keySet()) {
+        int applied = 0;
+        int unchanged = 0;
+        int skipped = 0;
+        int failed = 0;
+
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+            String key = entry.getKey();
             if (key.equals("persist.sys.timezone")) continue;
-            setField(key, map.get(key));
+            String result = setField(key, entry.getValue());
+            if ("applied".equals(result)) applied++;
+            else if ("unchanged".equals(result)) unchanged++;
+            else if ("skipped".equals(result)) skipped++;
+            else failed++;
         }
+
+        LOG("Per-app spoofing summary: applied=" + applied + ", unchanged=" + unchanged
+                + ", skipped=" + skipped + ", failed=" + failed
+                + ", profileFields=" + map.size());
     }
 
-    private static void setField(String name, String value) {
+    private static String setField(String name, String value) {
         if (value == null || value.isEmpty()) {
-            if (verboseLogs > 1) LOG(name + " is empty, skipping");
-            return;
+            LOG("[" + name + "]: skipped (empty value)");
+            return "skipped";
         }
 
         // API-level constants describe the actual running Android framework. They are
@@ -96,8 +113,8 @@ public final class EntryPointApps {
                 name.equals("SUPPORTED_32_BIT_ABIS") ||
                 name.equals("SUPPORTED_64_BIT_ABIS") ||
                 name.equals("ALL_CODENAMES")) {
-            if (verboseLogs > 1) LOG("[" + name + "]: skipped (runtime-sensitive field)");
-            return;
+            LOG("[" + name + "]: skipped (runtime-sensitive field; changing this can make the process inconsistent)");
+            return "skipped";
         }
 
         Field field = null;
@@ -113,12 +130,12 @@ public final class EntryPointApps {
                 // Real system properties without a corresponding Build field are
                 // intentionally not changed here. Changing them requires native
                 // property interception and can destabilize native/integrity code.
-                if (verboseLogs > 1) LOG("No safe Build field for property '" + name + "', skipping");
-                return;
+                LOG("[" + name + "]: skipped (no matching Build/Build.VERSION field)");
+                return "skipped";
             }
         } catch (NoSuchFieldException e) {
-            LOG("Couldn't find '" + name + "' field: " + e);
-            return;
+            LOG("[" + name + "]: failed to find field: " + e);
+            return "failed";
         }
 
         field.setAccessible(true);
@@ -127,42 +144,64 @@ public final class EntryPointApps {
             accessFlagsField.setAccessible(true);
             accessFlagsField.setInt(field, field.getModifiers() & ~java.lang.reflect.Modifier.FINAL);
         } catch (NoSuchFieldException | IllegalAccessException e) {
-            LOG("Couldn't modify accessFlags for '" + name + "': " + e);
+            LOG("[" + name + "]: warning: couldn't modify reflection access flags: " + e);
         }
 
         try {
             oldValue = String.valueOf(field.get(null));
         } catch (IllegalAccessException e) {
-            LOG("Couldn't access '" + name + "' value: " + e);
-            return;
+            LOG("[" + name + "]: failed to read current value: " + e);
+            return "failed";
         }
 
         if (value.equals(oldValue)) {
-            if (verboseLogs > 2) LOG("[" + name + "]: " + value + " (unchanged)");
-            return;
+            LOG("[" + name + "]: unchanged (" + value + ")");
+            return "unchanged";
         }
 
         Class<?> fieldType = field.getType();
-        if (fieldType == String.class) {
-            newValue = value;
-        } else if (fieldType == int.class) {
-            newValue = Integer.parseInt(value);
-        } else if (fieldType == long.class) {
-            newValue = Long.parseLong(value);
-        } else if (fieldType == boolean.class) {
-            newValue = Boolean.parseBoolean(value);
-        } else {
-            LOG("Couldn't convert '" + value + "' to '" + fieldType.getName() + "'");
-            return;
+        try {
+            if (fieldType == String.class) {
+                newValue = value;
+            } else if (fieldType == int.class) {
+                newValue = Integer.parseInt(value);
+            } else if (fieldType == long.class) {
+                newValue = Long.parseLong(value);
+            } else if (fieldType == boolean.class) {
+                if (!"true".equalsIgnoreCase(value) && !"false".equalsIgnoreCase(value)) {
+                    LOG("[" + name + "]: failed (invalid boolean value '" + value + "')");
+                    return "failed";
+                }
+                newValue = Boolean.parseBoolean(value);
+            } else {
+                LOG("[" + name + "]: failed (unsupported field type " + fieldType.getName() + ")");
+                return "failed";
+            }
+        } catch (NumberFormatException e) {
+            LOG("[" + name + "]: failed to parse '" + value + "' as " + fieldType.getName());
+            return "failed";
         }
 
         try {
             setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), newValue);
+            if (fieldType == String.class) {
+                String actual = String.valueOf(field.get(null));
+                if (!value.equals(actual)) {
+                    LOG("[" + name + "]: verification failed; requested='" + value + "', actual='" + actual + "'");
+                    return "failed";
+                }
+            } else if (!String.valueOf(field.get(null)).equals(String.valueOf(newValue))) {
+                LOG("[" + name + "]: verification failed; requested='" + newValue
+                        + "', actual='" + String.valueOf(field.get(null)) + "'");
+                return "failed";
+            }
         } catch (Exception e) {
-            LOG("Native setField failed for '" + name + "': " + e);
+            LOG("[" + name + "]: native write/verification failed: " + e);
+            return "failed";
         }
 
-        LOG("[" + name + "]: " + oldValue + " -> " + value);
+        LOG("[" + name + "]: applied '" + oldValue + "' -> '" + value + "'");
+        return "applied";
     }
 
     private static boolean classContainsField(Class<?> className, String fieldName) {
