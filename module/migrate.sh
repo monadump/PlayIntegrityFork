@@ -229,7 +229,7 @@ for SETTING in $ADVSETTINGS; do
 done;
 }
 
-ADVSETTINGS="verboseLogs spoofApps spoofBuild spoofProps spoofProvider spoofSignature spoofVendingFinger spoofVendingSdk spoofPixel"
+ADVSETTINGS="verboseLogs spoofApps spoofBuild spoofProps spoofProvider spoofSignature spoofVendingFinger spoofVendingSdk spoofPatch spoofPixel"
 
 # Default advanced values
 verboseLogs=0
@@ -240,6 +240,7 @@ spoofProvider=0
 spoofSignature=0
 spoofVendingFinger=1
 spoofVendingSdk=0
+spoofPatch=1
 spoofPixel=0
 
 # Check if Google Wallet is installed
@@ -325,7 +326,7 @@ else
 fi
 
 # Normalize JSON booleans into the numeric values consumed by MeowDump's native parser.
-for SETTING in spoofApps spoofBuild spoofProps spoofProvider spoofSignature spoofVendingFinger spoofVendingSdk spoofPixel verboseLogs; do
+for SETTING in spoofApps spoofBuild spoofProps spoofProvider spoofSignature spoofVendingFinger spoofVendingSdk spoofPatch spoofPixel verboseLogs; do
   eval VALUE=\$$SETTING;
   case "$VALUE" in
     true|TRUE) VALUE=1;;
