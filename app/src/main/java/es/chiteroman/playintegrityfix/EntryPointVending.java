@@ -13,7 +13,7 @@ public final class EntryPointVending {
     }
 
     @SuppressLint("DefaultLocale")
-    public static void init(int verboseLogs, int spoofVendingFinger, int spoofVendingSdk, String vendingFingerprintValue, int spoofPixel, String brandValue, String deviceValue, String modelValue) {
+    public static void init(int verboseLogs, int spoofVendingFinger, int spoofVendingSdk, String vendingFingerprintValue, int spoofPixel, String brandValue, String deviceValue, String modelValue, int spoofPatch, String releaseValue, String securityPatchValue) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             HiddenApiBypass.addHiddenApiExemptions("");
         }
@@ -25,11 +25,18 @@ public final class EntryPointVending {
             if (modelValue != null && !modelValue.isEmpty()) spoofField("MODEL", modelValue, verboseLogs);
         }
         
-        // Only spoof FINGERPRINT to Play Store if not forcing Android <13 Play Integrity verdict
-        if (spoofVendingSdk < 1) {
-            if (spoofVendingFinger < 1) return;
+        // Spoof Android release and security patch independently of spoofVendingSdk.
+        if (spoofPatch > 0) {
+            spoofVersionField("RELEASE", releaseValue, verboseLogs);
+            spoofVersionField("SECURITY_PATCH", securityPatchValue, verboseLogs);
+        }
+
+        // Keep fingerprint and SDK spoofing behavior independent from spoofPatch.
+        if (spoofVendingFinger > 0 && spoofVendingSdk < 1) {
             spoofField("FINGERPRINT", vendingFingerprintValue, verboseLogs);
-        } else {
+        }
+
+        if (spoofVendingSdk > 0) {
             int requestSdk = spoofVendingSdk == 1 ? 32 : spoofVendingSdk;
             int targetSdk = Math.min(Build.VERSION.SDK_INT, requestSdk);
             Field field = null;
@@ -62,6 +69,40 @@ public final class EntryPointVending {
                      NullPointerException | ExceptionInInitializerError e) {
                 LOG("SDK_INT field not accessible: " + e);
             }
+        }
+    }
+
+    private static void spoofVersionField(String fieldName, String value, int verboseLogs) {
+        if (value == null || value.isEmpty()) return;
+        Field field = null;
+        try {
+            field = Build.VERSION.class.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            try {
+                Field accessFlagsField = Field.class.getDeclaredField("accessFlags");
+                accessFlagsField.setAccessible(true);
+                accessFlagsField.setInt(field, field.getModifiers() & ~java.lang.reflect.Modifier.FINAL);
+            } catch (NoSuchFieldException | IllegalAccessException e) {
+                LOG("Couldn't modify accessFlags for VERSION." + fieldName + ": " + e);
+            }
+            String oldValue = String.valueOf(field.get(null));
+            if (oldValue.equals(value)) {
+                if (verboseLogs > 2) LOG(String.format("[VERSION.%s]: %s (unchanged)", fieldName, oldValue));
+                field.setAccessible(false);
+                return;
+            }
+            try {
+                setFieldNative(field.getDeclaringClass(), field, field.getType().getName(), value);
+            } catch (Exception e) {
+                LOG("Native setField failed for VERSION." + fieldName + ": " + e);
+            }
+            field.setAccessible(false);
+            LOG(String.format("[VERSION.%s]: %s -> %s", fieldName, oldValue, value));
+        } catch (NoSuchFieldException e) {
+            LOG("VERSION." + fieldName + " field not found: " + e);
+        } catch (SecurityException | IllegalAccessException | IllegalArgumentException |
+                 NullPointerException | ExceptionInInitializerError e) {
+            LOG("VERSION." + fieldName + " field not accessible: " + e);
         }
     }
 
