@@ -83,14 +83,17 @@ static bool writeFully(int fd, const void *buffer, size_t size) {
 }
 
 static int parseIntOrKeep(const std::string &value, int current, const char *key) {
-    const char *start = value.c_str();
-    char *end = nullptr;
+    if (value.empty()) {
+        LOGD("Invalid integer for %s; keeping previous value %d", key, current);
+        return current;
+    }
 
     errno = 0;
-    const long parsed = std::strtol(start, &end, 10);
-    if (start == end || errno == ERANGE ||
-        parsed < INT_MIN || parsed > INT_MAX ||
-        static_cast<size_t>(end - start) != value.size()) {
+    char *end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+
+    if (errno == ERANGE || end == value.c_str() || end == nullptr ||
+        *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
         LOGD("Invalid integer for %s; keeping previous value %d", key, current);
         return current;
     }
@@ -713,9 +716,15 @@ private:
     nlohmann::json json;
     std::string pkgName;
     std::string vendingFingerprintValue;
+    std::string manufacturerValue;
     std::string brandValue;
-    std::string deviceValue;
     std::string modelValue;
+    std::string productValue;
+    std::string deviceValue;
+    std::string idValue;
+    std::string incrementalValue;
+    std::string typeValue;
+    std::string tagsValue;
     std::string releaseValue;
     std::string securityPatchValue;
 
@@ -852,37 +861,23 @@ private:
             json.erase("spoofApps");
         }
 
-        if (json.contains("BRAND") &&
-            !json["BRAND"].is_null() &&
-            json["BRAND"].is_string() &&
-            json["BRAND"] != "") {
+        auto readStringField = [this](const char *key, std::string &target) {
+            if (json.contains(key) && json[key].is_string()) {
+                target = json[key].get<std::string>();
+            }
+        };
 
-            brandValue = json["BRAND"].get<std::string>();
-        }
-
-        if (json.contains("DEVICE") &&
-            !json["DEVICE"].is_null() &&
-            json["DEVICE"].is_string() &&
-            json["DEVICE"] != "") {
-
-            deviceValue = json["DEVICE"].get<std::string>();
-        }
-
-        if (json.contains("MODEL") &&
-            !json["MODEL"].is_null() &&
-            json["MODEL"].is_string() &&
-            json["MODEL"] != "") {
-
-            modelValue = json["MODEL"].get<std::string>();
-        }
-
-        if (json.contains("RELEASE") && json["RELEASE"].is_string()) {
-            releaseValue = json["RELEASE"].get<std::string>();
-        }
-
-        if (json.contains("SECURITY_PATCH") && json["SECURITY_PATCH"].is_string()) {
-            securityPatchValue = json["SECURITY_PATCH"].get<std::string>();
-        }
+        readStringField("MANUFACTURER", manufacturerValue);
+        readStringField("BRAND", brandValue);
+        readStringField("MODEL", modelValue);
+        readStringField("PRODUCT", productValue);
+        readStringField("DEVICE", deviceValue);
+        readStringField("ID", idValue);
+        readStringField("INCREMENTAL", incrementalValue);
+        readStringField("TYPE", typeValue);
+        readStringField("TAGS", tagsValue);
+        readStringField("RELEASE", releaseValue);
+        readStringField("SECURITY_PATCH", securityPatchValue);
 
         if (pkgName == VENDING_PACKAGE) {
             json.clear();
@@ -1141,38 +1136,50 @@ private:
                     env->GetStaticMethodID(
                             entryClass,
                             "init",
-                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
+                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
                     );
 
+            if (entryInit == nullptr || env->ExceptionCheck()) {
+                LOGD("JNI %s: EntryPointVending.init method lookup failed; skipping injection", niceName);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            } else {
             auto javaStr =
                     env->NewStringUTF(
                             vendingFingerprintValue.c_str()
                     );
 
-            auto brandStr =
-                    env->NewStringUTF(
-                            brandValue.c_str()
-                    );
+            auto manufacturerStr =
+                    env->NewStringUTF(manufacturerValue.c_str());
 
-            auto deviceStr =
-                    env->NewStringUTF(
-                            deviceValue.c_str()
-                    );
+            auto brandStr =
+                    env->NewStringUTF(brandValue.c_str());
 
             auto modelStr =
-                    env->NewStringUTF(
-                            modelValue.c_str()
-                    );
+                    env->NewStringUTF(modelValue.c_str());
+
+            auto productStr =
+                    env->NewStringUTF(productValue.c_str());
+
+            auto deviceStr =
+                    env->NewStringUTF(deviceValue.c_str());
+
+            auto idStr =
+                    env->NewStringUTF(idValue.c_str());
+
+            auto incrementalStr =
+                    env->NewStringUTF(incrementalValue.c_str());
+
+            auto typeStr =
+                    env->NewStringUTF(typeValue.c_str());
+
+            auto tagsStr =
+                    env->NewStringUTF(tagsValue.c_str());
 
             auto releaseStr =
-                    env->NewStringUTF(
-                            releaseValue.c_str()
-                    );
+                    env->NewStringUTF(releaseValue.c_str());
 
             auto securityPatchStr =
-                    env->NewStringUTF(
-                            securityPatchValue.c_str()
-                    );
+                    env->NewStringUTF(securityPatchValue.c_str());
 
             env->CallStaticVoidMethod(
                     entryClass,
@@ -1182,21 +1189,33 @@ private:
                     spoofVendingSdk,
                     javaStr,
                     spoofPixel,
+                    manufacturerStr,
                     brandStr,
-                    deviceStr,
                     modelStr,
+                    productStr,
+                    deviceStr,
+                    idStr,
+                    incrementalStr,
+                    typeStr,
+                    tagsStr,
                     spoofPatch,
                     releaseStr,
                     securityPatchStr
             );
 
             env->DeleteLocalRef(javaStr);
+            env->DeleteLocalRef(manufacturerStr);
             env->DeleteLocalRef(brandStr);
-            env->DeleteLocalRef(deviceStr);
             env->DeleteLocalRef(modelStr);
+            env->DeleteLocalRef(productStr);
+            env->DeleteLocalRef(deviceStr);
+            env->DeleteLocalRef(idStr);
+            env->DeleteLocalRef(incrementalStr);
+            env->DeleteLocalRef(typeStr);
+            env->DeleteLocalRef(tagsStr);
             env->DeleteLocalRef(releaseStr);
             env->DeleteLocalRef(securityPatchStr);
-
+            }
         } else {
             LOGD(
                     "JNI %s: Sending JSON",
