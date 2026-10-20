@@ -359,9 +359,6 @@ static bool loadAppProfile() {
         else if (name == "ro.build.version.security_patch") buildField = "SECURITY_PATCH";
         else if (name == "ro.build.version.codename") buildField = "CODENAME";
         else if (name == "ro.build.version.all_codenames") buildField = "ALL_CODENAMES";
-        else if (name == "ro.build.description") buildField = "DESCRIPTION";
-        else if (name == "ro.build.flavor") buildField = "FLAVOR";
-        else if (name == "ro.product.characteristics" || name == "ro.build.characteristics") buildField = "CHARACTERISTICS";
         else if (name == "ro.build.version.base_os") buildField = "BASE_OS";
         else if (name == "ro.build.display.id") buildField = "DISPLAY";
         else if (name == "ro.build.user") buildField = "USER";
@@ -375,7 +372,15 @@ static bool loadAppProfile() {
             profileBuild[buildField] = value;
             LOGD("App profile mapping: %s -> Build.%s", name.c_str(), buildField);
         } else {
-            LOGD("App profile property has no Build mapping: %s (property is not changed by per-app Build spoofing)", name.c_str());
+            const bool propertyOnly = name == "ro.build.description" || name == "ro.build.flavor"
+                    || name == "ro.product.characteristics" || name == "ro.build.characteristics"
+                    || name == "ro.build.product" || name == "ro.build.date" || name == "ro.build.date.utc"
+                    || name == "ro.board.platform";
+            if (propertyOnly) {
+                LOGD("App profile property unsupported by Build-field spoofing: %s (not a Build/Build.VERSION field; left unchanged)", name.c_str());
+            } else {
+                LOGD("App profile property has no Build mapping: %s (not changed by per-app Build spoofing)", name.c_str());
+            }
         }
     }
 
