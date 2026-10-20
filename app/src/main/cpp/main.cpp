@@ -640,9 +640,15 @@ private:
     nlohmann::json json;
     std::string pkgName;
     std::string vendingFingerprintValue;
+    std::string manufacturerValue;
     std::string brandValue;
-    std::string deviceValue;
     std::string modelValue;
+    std::string productValue;
+    std::string deviceValue;
+    std::string idValue;
+    std::string incrementalValue;
+    std::string typeValue;
+    std::string tagsValue;
     std::string releaseValue;
     std::string securityPatchValue;
 
@@ -779,28 +785,40 @@ private:
             json.erase("spoofApps");
         }
 
-        if (json.contains("BRAND") &&
-            !json["BRAND"].is_null() &&
-            json["BRAND"].is_string() &&
-            json["BRAND"] != "") {
+        if (json.contains("MANUFACTURER") && json["MANUFACTURER"].is_string()) {
+            manufacturerValue = json["MANUFACTURER"].get<std::string>();
+        }
 
+        if (json.contains("BRAND") && json["BRAND"].is_string()) {
             brandValue = json["BRAND"].get<std::string>();
         }
 
-        if (json.contains("DEVICE") &&
-            !json["DEVICE"].is_null() &&
-            json["DEVICE"].is_string() &&
-            json["DEVICE"] != "") {
+        if (json.contains("MODEL") && json["MODEL"].is_string()) {
+            modelValue = json["MODEL"].get<std::string>();
+        }
 
+        if (json.contains("PRODUCT") && json["PRODUCT"].is_string()) {
+            productValue = json["PRODUCT"].get<std::string>();
+        }
+
+        if (json.contains("DEVICE") && json["DEVICE"].is_string()) {
             deviceValue = json["DEVICE"].get<std::string>();
         }
 
-        if (json.contains("MODEL") &&
-            !json["MODEL"].is_null() &&
-            json["MODEL"].is_string() &&
-            json["MODEL"] != "") {
+        if (json.contains("ID") && json["ID"].is_string()) {
+            idValue = json["ID"].get<std::string>();
+        }
 
-            modelValue = json["MODEL"].get<std::string>();
+        if (json.contains("INCREMENTAL") && json["INCREMENTAL"].is_string()) {
+            incrementalValue = json["INCREMENTAL"].get<std::string>();
+        }
+
+        if (json.contains("TYPE") && json["TYPE"].is_string()) {
+            typeValue = json["TYPE"].get<std::string>();
+        }
+
+        if (json.contains("TAGS") && json["TAGS"].is_string()) {
+            tagsValue = json["TAGS"].get<std::string>();
         }
 
         if (json.contains("RELEASE") && json["RELEASE"].is_string()) {
@@ -1068,7 +1086,7 @@ private:
                     env->GetStaticMethodID(
                             entryClass,
                             "init",
-                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
+                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
                     );
 
             auto javaStr =
@@ -1076,20 +1094,32 @@ private:
                             vendingFingerprintValue.c_str()
                     );
 
-            auto brandStr =
-                    env->NewStringUTF(
-                            brandValue.c_str()
-                    );
+            auto manufacturerStr =
+                    env->NewStringUTF(manufacturerValue.c_str());
 
-            auto deviceStr =
-                    env->NewStringUTF(
-                            deviceValue.c_str()
-                    );
+            auto brandStr =
+                    env->NewStringUTF(brandValue.c_str());
 
             auto modelStr =
-                    env->NewStringUTF(
-                            modelValue.c_str()
-                    );
+                    env->NewStringUTF(modelValue.c_str());
+
+            auto productStr =
+                    env->NewStringUTF(productValue.c_str());
+
+            auto deviceStr =
+                    env->NewStringUTF(deviceValue.c_str());
+
+            auto idStr =
+                    env->NewStringUTF(idValue.c_str());
+
+            auto incrementalStr =
+                    env->NewStringUTF(incrementalValue.c_str());
+
+            auto typeStr =
+                    env->NewStringUTF(typeValue.c_str());
+
+            auto tagsStr =
+                    env->NewStringUTF(tagsValue.c_str());
 
             auto releaseStr =
                     env->NewStringUTF(
@@ -1109,18 +1139,30 @@ private:
                     spoofVendingSdk,
                     javaStr,
                     spoofPixel,
+                    manufacturerStr,
                     brandStr,
-                    deviceStr,
                     modelStr,
+                    productStr,
+                    deviceStr,
+                    idStr,
+                    incrementalStr,
+                    typeStr,
+                    tagsStr,
                     spoofPatch,
                     releaseStr,
                     securityPatchStr
             );
 
             env->DeleteLocalRef(javaStr);
+            env->DeleteLocalRef(manufacturerStr);
             env->DeleteLocalRef(brandStr);
-            env->DeleteLocalRef(deviceStr);
             env->DeleteLocalRef(modelStr);
+            env->DeleteLocalRef(productStr);
+            env->DeleteLocalRef(deviceStr);
+            env->DeleteLocalRef(idStr);
+            env->DeleteLocalRef(incrementalStr);
+            env->DeleteLocalRef(typeStr);
+            env->DeleteLocalRef(tagsStr);
             env->DeleteLocalRef(releaseStr);
             env->DeleteLocalRef(securityPatchStr);
 
