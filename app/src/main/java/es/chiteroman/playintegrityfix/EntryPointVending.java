@@ -13,16 +13,22 @@ public final class EntryPointVending {
     }
 
     @SuppressLint("DefaultLocale")
-    public static void init(int verboseLogs, int spoofVendingFinger, int spoofVendingSdk, String vendingFingerprintValue, int spoofPixel, String brandValue, String deviceValue, String modelValue, int spoofPatch, String releaseValue, String securityPatchValue) {
+    public static void init(int verboseLogs, int spoofVendingFinger, int spoofVendingSdk, String vendingFingerprintValue, int spoofPixel, String manufacturerValue, String brandValue, String modelValue, String productValue, String deviceValue, String idValue, String incrementalValue, String typeValue, String tagsValue, int spoofPatch, String releaseValue, String securityPatchValue) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             HiddenApiBypass.addHiddenApiExemptions("");
         }
         
-        // Spoof Pixel fields (BRAND, DEVICE, MODEL) if enabled
+        // Spoof Pixel build identity fields if enabled
         if (spoofPixel > 0) {
+            if (manufacturerValue != null && !manufacturerValue.isEmpty()) spoofField("MANUFACTURER", manufacturerValue, verboseLogs);
             if (brandValue != null && !brandValue.isEmpty()) spoofField("BRAND", brandValue, verboseLogs);
-            if (deviceValue != null && !deviceValue.isEmpty()) spoofField("DEVICE", deviceValue, verboseLogs);
             if (modelValue != null && !modelValue.isEmpty()) spoofField("MODEL", modelValue, verboseLogs);
+            if (productValue != null && !productValue.isEmpty()) spoofField("PRODUCT", productValue, verboseLogs);
+            if (deviceValue != null && !deviceValue.isEmpty()) spoofField("DEVICE", deviceValue, verboseLogs);
+            if (idValue != null && !idValue.isEmpty()) spoofField("ID", idValue, verboseLogs);
+            if (incrementalValue != null && !incrementalValue.isEmpty()) spoofVersionField("INCREMENTAL", incrementalValue, verboseLogs);
+            if (typeValue != null && !typeValue.isEmpty()) spoofField("TYPE", typeValue, verboseLogs);
+            if (tagsValue != null && !tagsValue.isEmpty()) spoofField("TAGS", tagsValue, verboseLogs);
         }
         
         // Spoof Android release and security patch independently of spoofVendingSdk.
