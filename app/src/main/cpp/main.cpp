@@ -350,7 +350,8 @@ static bool loadAppProfile() {
         else if (name == "ro.product.board") buildField = "BOARD";
         else if (name == "ro.build.fingerprint") buildField = "FINGERPRINT";
         else if (name == "ro.build.version.release") buildField = "RELEASE";
-        else if (name == "ro.build.version.sdk") buildField = "SDK";
+        else if (name == "ro.build.version.sdk") buildField = "SDK_INT";
+        else if (name == "ro.build.version.preview_sdk") buildField = "PREVIEW_SDK_INT";
         else if (name == "ro.build.id") buildField = "ID";
         else if (name == "ro.build.version.incremental") buildField = "INCREMENTAL";
         else if (name == "ro.build.type") buildField = "TYPE";
@@ -358,6 +359,9 @@ static bool loadAppProfile() {
         else if (name == "ro.build.version.security_patch") buildField = "SECURITY_PATCH";
         else if (name == "ro.build.version.codename") buildField = "CODENAME";
         else if (name == "ro.build.version.all_codenames") buildField = "ALL_CODENAMES";
+        else if (name == "ro.build.description") buildField = "DESCRIPTION";
+        else if (name == "ro.build.flavor") buildField = "FLAVOR";
+        else if (name == "ro.product.characteristics" || name == "ro.build.characteristics") buildField = "CHARACTERISTICS";
         else if (name == "ro.build.version.base_os") buildField = "BASE_OS";
         else if (name == "ro.build.display.id") buildField = "DISPLAY";
         else if (name == "ro.build.user") buildField = "USER";
@@ -366,9 +370,13 @@ static bool loadAppProfile() {
         else if (name == "ro.hardware") buildField = "HARDWARE";
         else if (name == "ro.soc.manufacturer") buildField = "SOC_MANUFACTURER";
         else if (name == "ro.soc.model") buildField = "SOC_MODEL";
-        else if (name == "ro.soc.manufacturer") buildField = "SOC_MANUFACTURER";
 
-        if (buildField) profileBuild[buildField] = value;
+        if (buildField) {
+            profileBuild[buildField] = value;
+            LOGD("App profile mapping: %s -> Build.%s", name.c_str(), buildField);
+        } else {
+            LOGD("App profile property has no Build mapping: %s (property is not changed by per-app Build spoofing)", name.c_str());
+        }
     }
 
     appJson = profileBuild;
@@ -389,7 +397,7 @@ static bool loadAppProfile() {
     logProfileValue("ro.soc.manufacturer");
     logProfileValue("ro.soc.model");
 
-    LOGD("Loaded app profile: %d properties, %d Build fields", static_cast<int>(appJsonProps.size()), static_cast<int>(profileBuild.size()));
+    LOGD("Loaded app profile: %d non-empty properties, %d mapped Build fields, %d JSON entries", static_cast<int>(appJsonProps.size()), static_cast<int>(profileBuild.size()), static_cast<int>(appJson.size()));
     return !appJsonProps.empty();
 }
 
