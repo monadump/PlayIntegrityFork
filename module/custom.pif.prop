@@ -27,4 +27,5 @@ spoofProvider=0
 spoofSignature=1
 spoofVendingFinger=1
 spoofVendingSdk=0
+spoofPatch=1
 spoofPixel=1
