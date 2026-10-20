@@ -94,13 +94,6 @@ public final class EntryPointApps {
             return "skipped";
         }
 
-        // API-level constants describe the actual running Android framework. They are
-        // initialized from system properties and are documented as stable for a boot.
-        // Never rewrite them after the framework has initialized.
-
-        // Do not mutate runtime-sensitive fields. Native libraries may use
-        // these values to select ABI/SDK-specific code paths; changing them
-        // creates an inconsistent process and can cause native crashes.
         if (name.equals("SDK_INT") ||
                 name.equals("SDK_INT_FULL") ||
                 name.equals("DEVICE_INITIAL_SDK_INT") ||
@@ -127,10 +120,17 @@ public final class EntryPointApps {
             } else if (classContainsField(Build.VERSION.class, name)) {
                 field = Build.VERSION.class.getDeclaredField(name);
             } else {
-                // Real system properties without a corresponding Build field are
-                // intentionally not changed here. Changing them requires native
-                // property interception and can destabilize native/integrity code.
-                LOG("[" + name + "]: skipped (no matching Build/Build.VERSION field)");
+                // SOC_* fields were added in Android 12 (API 31). Older releases do not
+                // expose them on android.os.Build, so reflection cannot spoof them there.
+                if ((name.equals("SOC_MANUFACTURER") || name.equals("SOC_MODEL"))
+                        && Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                    LOG("[" + name + "]: skipped (requires Android 12/API 31 or newer; current API="
+                            + Build.VERSION.SDK_INT + ")");
+                } else {
+                    // Properties such as DESCRIPTION, FLAVOR, and CHARACTERISTICS do not
+                    // correspond to fields on android.os.Build on this runtime.
+                    LOG("[" + name + "]: skipped (field is not exposed by Build/Build.VERSION on this Android release)");
+                }
                 return "skipped";
             }
         } catch (NoSuchFieldException e) {
