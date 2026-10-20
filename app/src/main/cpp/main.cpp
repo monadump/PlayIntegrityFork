@@ -19,7 +19,6 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -84,15 +83,19 @@ static bool writeFully(int fd, const void *buffer, size_t size) {
 }
 
 static int parseIntOrKeep(const std::string &value, int current, const char *key) {
-    try {
-        size_t consumed = 0;
-        const int parsed = std::stoi(value, &consumed, 10);
-        if (consumed != value.size()) throw std::invalid_argument("trailing characters");
-        return parsed;
-    } catch (const std::exception &) {
+    const char *start = value.c_str();
+    char *end = nullptr;
+
+    errno = 0;
+    const long parsed = std::strtol(start, &end, 10);
+    if (start == end || errno == ERANGE ||
+        parsed < INT_MIN || parsed > INT_MAX ||
+        static_cast<size_t>(end - start) != value.size()) {
         LOGD("Invalid integer for %s; keeping previous value %d", key, current);
         return current;
     }
+
+    return static_cast<int>(parsed);
 }
 
 static bool readFileIntoVector(FILE *file, std::vector<char> &out, size_t maxSize) {
