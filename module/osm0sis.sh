@@ -305,7 +305,7 @@ if [ -f "$MIGRATE" ]; then
         esac;
       fi;
     }
-    ADVSETTINGS="verboseLogs spoofApps spoofBuild spoofProps spoofProvider spoofSignature spoofVendingFinger spoofVendingSdk spoofPixel";
+    ADVSETTINGS="verboseLogs spoofApps spoofBuild spoofProps spoofProvider spoofSignature spoofVendingFinger spoofVendingSdk spoofPatch spoofPixel";
     for SETTING in $ADVSETTINGS; do
       eval [ -z \"\$$SETTING\" ] \&\& $SETTING=$(grep_config "$SETTING" $OLDPIF);
       eval TMPVAL=\$$SETTING;
