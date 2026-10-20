@@ -614,6 +614,17 @@ h1 .material-icons{
        <span class="slider"><span class="knob"></span></span>
      </label>
    </div>
+   <div class="row" id="row-spoofPatch" onclick="toggle('spoofPatch')">
+     <div class="icon-wrap"><span class="material-icons">system_update</span></div>
+     <div class="content">
+       <div class="title">Android Version & Patch</div>
+     </div>
+     <div class="status-dot"></div>
+     <label class="switch" onclick="event.stopPropagation()">
+       <input id="spoofPatch" type="checkbox">
+       <span class="slider"><span class="knob"></span></span>
+     </label>
+   </div>
    <div class="row" id="row-spoofVendingSdk" onclick="toggle('spoofVendingSdk')">
      <div class="icon-wrap"><span class="material-icons">engineering</span></div>
      <div class="content">
@@ -646,7 +657,7 @@ const PROP_CANDIDATES = [
  "/data/adb/custom.pif.prop"
 ];
 
-const KEYS = ["spoofBuild","spoofProps","spoofProvider","spoofSignature","spoofVendingFinger","spoofVendingSdk","spoofPixel"];
+const KEYS = ["spoofBuild","spoofProps","spoofProvider","spoofSignature","spoofVendingFinger","spoofVendingSdk","spoofPatch","spoofPixel"];
 const ZYGISK_PATH = "/data/adb/modules/playintegrityfix/zygisk";
 const FLAG_DIR = "/data/adb/Box-Brain/PIF";
 const STOP_FLAG = "/data/adb/Box-Brain/PIF/stop";
@@ -666,6 +677,7 @@ const pifRows = [
  {id:"spoofProps",icon:"android",title:"GMS Spoof",sub:"GMS properties"},
  {id:"spoofProvider",icon:"dynamic_form",title:"Attestation API",sub:"Breaks Google Wallet"},
  {id:"spoofSignature",icon:"verified_user",title:"ROM Signature",sub:"OEM-signed mask"},
+ {id:"spoofPatch",icon:"system_update",title:"Android Version & Patch",sub:"Spoofs Android release and SECURITY_PATCH from the selected build profile"},
  {id:"spoofVendingSdk",icon:"key_off",title:"A10 Downgrade SDK",sub:"Use if keybox is banned"}
 ];
 
