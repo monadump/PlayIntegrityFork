@@ -43,6 +43,7 @@ static int spoofProvider = 1;
 static int spoofSignature = 0;
 static int spoofVendingFinger = 0;
 static int spoofVendingSdk = 0;
+static int spoofPatch = 0;
 static int spoofPixel = 0;
 static int spoofApps = 0;
 
@@ -580,7 +581,7 @@ public:
         if (pkgName == VENDING_PACKAGE)
             spoofBuild = spoofProps = spoofProvider = spoofSignature = 0;
         else
-            spoofVendingFinger = spoofVendingSdk = spoofPixel = 0;
+            spoofVendingFinger = spoofVendingSdk = spoofPatch = spoofPixel = 0;
 
         bool isDroidGuardOrVending =
                 pkgName == DROIDGUARD_PACKAGE ||
@@ -614,6 +615,7 @@ public:
                 spoofSignature +
                 spoofVendingFinger +
                 spoofVendingSdk +
+                spoofPatch +
                 spoofPixel > 0) {
                 inject();
             }
@@ -641,6 +643,8 @@ private:
     std::string brandValue;
     std::string deviceValue;
     std::string modelValue;
+    std::string releaseValue;
+    std::string securityPatchValue;
 
     bool isTargetApp = false;
 
@@ -680,6 +684,23 @@ private:
             }
 
             json.erase("spoofVendingSdk");
+        }
+
+        if (json.contains("spoofPatch")) {
+            if (!json["spoofPatch"].is_null() &&
+                json["spoofPatch"].is_string() &&
+                json["spoofPatch"] != "") {
+
+                spoofPatch = stoi(json["spoofPatch"].get<std::string>());
+
+                if (verboseLogs > 0)
+                    LOGD("Spoofing Android release and security patch %s!",
+                         (spoofPatch > 0) ? "enabled" : "disabled");
+            } else {
+                LOGD("Error parsing spoofPatch!");
+            }
+
+            json.erase("spoofPatch");
         }
 
         if (json.contains("spoofVendingFinger")) {
@@ -780,6 +801,14 @@ private:
             json["MODEL"] != "") {
 
             modelValue = json["MODEL"].get<std::string>();
+        }
+
+        if (json.contains("RELEASE") && json["RELEASE"].is_string()) {
+            releaseValue = json["RELEASE"].get<std::string>();
+        }
+
+        if (json.contains("SECURITY_PATCH") && json["SECURITY_PATCH"].is_string()) {
+            securityPatchValue = json["SECURITY_PATCH"].get<std::string>();
         }
 
         if (pkgName == VENDING_PACKAGE) {
@@ -1039,7 +1068,7 @@ private:
                     env->GetStaticMethodID(
                             entryClass,
                             "init",
-                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
+                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
                     );
 
             auto javaStr =
@@ -1062,6 +1091,16 @@ private:
                             modelValue.c_str()
                     );
 
+            auto releaseStr =
+                    env->NewStringUTF(
+                            releaseValue.c_str()
+                    );
+
+            auto securityPatchStr =
+                    env->NewStringUTF(
+                            securityPatchValue.c_str()
+                    );
+
             env->CallStaticVoidMethod(
                     entryClass,
                     entryInit,
@@ -1072,13 +1111,18 @@ private:
                     spoofPixel,
                     brandStr,
                     deviceStr,
-                    modelStr
+                    modelStr,
+                    spoofPatch,
+                    releaseStr,
+                    securityPatchStr
             );
 
             env->DeleteLocalRef(javaStr);
             env->DeleteLocalRef(brandStr);
             env->DeleteLocalRef(deviceStr);
             env->DeleteLocalRef(modelStr);
+            env->DeleteLocalRef(releaseStr);
+            env->DeleteLocalRef(securityPatchStr);
 
         } else {
             LOGD(
