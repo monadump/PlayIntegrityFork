@@ -14,6 +14,12 @@
 #endif
 
 #include <map>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,46 +58,113 @@ static std::map<std::string, std::string> appJsonProps;
 static nlohmann::json appJson = nlohmann::json::object();
 static std::string appProfileData;
 
+// File-descriptor I/O may complete partially or be interrupted by a signal.
+static bool readFully(int fd, void *buffer, size_t size) {
+    auto *bytes = static_cast<unsigned char *>(buffer);
+    size_t offset = 0;
+    while (offset < size) {
+        const ssize_t count = read(fd, bytes + offset, size - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        offset += static_cast<size_t>(count);
+    }
+    return true;
+}
+
+static bool writeFully(int fd, const void *buffer, size_t size) {
+    const auto *bytes = static_cast<const unsigned char *>(buffer);
+    size_t offset = 0;
+    while (offset < size) {
+        const ssize_t count = write(fd, bytes + offset, size - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        offset += static_cast<size_t>(count);
+    }
+    return true;
+}
+
+static int parseIntOrKeep(const std::string &value, int current, const char *key) {
+    try {
+        size_t consumed = 0;
+        const int parsed = std::stoi(value, &consumed, 10);
+        if (consumed != value.size()) throw std::invalid_argument("trailing characters");
+        return parsed;
+    } catch (const std::exception &) {
+        LOGD("Invalid integer for %s; keeping previous value %d", key, current);
+        return current;
+    }
+}
+
+static bool readFileIntoVector(FILE *file, std::vector<char> &out, size_t maxSize) {
+    if (file == nullptr || fseek(file, 0, SEEK_END) != 0) return false;
+    const long length = ftell(file);
+    if (length < 0 || static_cast<unsigned long long>(length) > maxSize ||
+        fseek(file, 0, SEEK_SET) != 0) return false;
+
+    out.resize(static_cast<size_t>(length));
+    if (!out.empty() && fread(out.data(), 1, out.size(), file) != out.size()) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static constexpr size_t MAX_DEX_PAYLOAD = 64U * 1024U * 1024U;
+static constexpr size_t MAX_CONFIG_PAYLOAD = 16U * 1024U * 1024U;
+static constexpr size_t MAX_APP_PROFILE_PAYLOAD = 16U * 1024U * 1024U;
+
 #if defined(__aarch64__) || defined(__arm__)
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 
-static std::map<void *, T_Callback> callbacks;
+// Android invokes the property callback synchronously. Keep the original callback and
+// cookie in a stack context instead of a process-global map keyed by caller-owned cookies.
+struct CallbackContext {
+    T_Callback callback;
+    void *originalCookie;
+};
 
 static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
-    if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
+    auto *context = static_cast<CallbackContext *>(cookie);
+    if (context == nullptr || context->callback == nullptr) return;
 
-    const char *oldValue = value;
-    std::string prop(name);
-
-    if (jsonProps.count(prop)) {
-        value = jsonProps[prop].c_str();
-    } else {
-        for (const auto &p : jsonProps) {
-            if (p.first.starts_with("*") && prop.ends_with(p.first.substr(1))) {
-                value = p.second.c_str();
-                break;
+    const char *replacement = value;
+    if (name != nullptr && value != nullptr) {
+        const std::string_view prop(name);
+        const auto exact = jsonProps.find(std::string(prop));
+        if (exact != jsonProps.end()) {
+            replacement = exact->second.c_str();
+        } else {
+            for (const auto &entry : jsonProps) {
+                const std::string_view pattern(entry.first);
+                if (!pattern.empty() && pattern.front() == '*' &&
+                    prop.ends_with(pattern.substr(1))) {
+                    replacement = entry.second.c_str();
+                    break;
+                }
             }
+        }
+
+        if (verboseLogs > 0 && replacement != nullptr && strcmp(value, replacement) != 0) {
+            LOGD("[%s]: %s -> %s", name, value, replacement);
+        } else if (verboseLogs > 99 && replacement != nullptr) {
+            LOGD("[%s]: %s (unchanged)", name, value);
         }
     }
 
-    if (oldValue == value) {
-        if (verboseLogs > 99) LOGD("[%s]: %s (unchanged)", name, oldValue);
-    } else {
-        LOGD("[%s]: %s -> %s", name, oldValue, value);
-    }
-
-    return callbacks[cookie](cookie, name, value, serial);
+    context->callback(context->originalCookie, name, replacement, serial);
 }
 
 static void (*o_system_property_read_callback)(const prop_info *, T_Callback, void *);
 
 static void my_system_property_read_callback(const prop_info *pi, T_Callback callback, void *cookie) {
+    if (o_system_property_read_callback == nullptr) return;
     if (pi == nullptr || callback == nullptr || cookie == nullptr) {
-        return o_system_property_read_callback(pi, callback, cookie);
+        o_system_property_read_callback(pi, callback, cookie);
+        return;
     }
 
-    callbacks[cookie] = callback;
-    return o_system_property_read_callback(pi, modify_callback, cookie);
+    CallbackContext context{callback, cookie};
+    o_system_property_read_callback(pi, modify_callback, &context);
 }
 
 extern "C" int sh_linker_init(void) {
@@ -424,28 +497,25 @@ public:
             return;
         }
 
-        if (read(fd, &dexSize, sizeof(long)) != sizeof(long) ||
-            read(fd, &configSize, sizeof(long)) != sizeof(long) ||
-            read(fd, &appProfileSize, sizeof(long)) != sizeof(long)) {
+        if (!readFully(fd, &dexSize, sizeof(long)) ||
+            !readFully(fd, &configSize, sizeof(long)) ||
+            !readFully(fd, &appProfileSize, sizeof(long))) {
             close(fd);
             LOGD("Couldn't read companion sizes");
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        if (dexSize < 1) {
+        if (dexSize < 1 || static_cast<unsigned long long>(dexSize) > MAX_DEX_PAYLOAD ||
+            configSize < 1 || static_cast<unsigned long long>(configSize) > MAX_CONFIG_PAYLOAD ||
+            appProfileSize < 0 || static_cast<unsigned long long>(appProfileSize) > MAX_APP_PROFILE_PAYLOAD) {
             close(fd);
-            LOGD("Couldn't read dex file");
+            LOGD("Companion returned invalid payload sizes (dex=%ld, config=%ld, profile=%ld)",
+                 dexSize, configSize, appProfileSize);
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        if (configSize < 1) {
-            close(fd);
-            LOGD("Couldn't read config file");
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
 
         LOGD("Read from file descriptor for 'dex' -> %ld bytes", dexSize);
         LOGD("Read from file descriptor for 'config' -> %ld bytes", configSize);
@@ -453,7 +523,7 @@ public:
 
         dexVector.resize(dexSize);
 
-        if (read(fd, dexVector.data(), dexSize) != dexSize) {
+        if (!readFully(fd, dexVector.data(), static_cast<size_t>(dexSize))) {
             close(fd);
             LOGD("Couldn't read dex payload");
             dexVector.clear();
@@ -463,7 +533,7 @@ public:
 
         configVector.resize(configSize);
 
-        if (read(fd, configVector.data(), configSize) != configSize) {
+        if (!readFully(fd, configVector.data(), static_cast<size_t>(configSize))) {
             close(fd);
             LOGD("Couldn't read config payload");
             dexVector.clear();
@@ -474,7 +544,7 @@ public:
 
         if (appProfileSize > 0) {
             appProfileData.resize(appProfileSize);
-            if (read(fd, appProfileData.data(), appProfileSize) != appProfileSize) {
+            if (!readFully(fd, appProfileData.data(), static_cast<size_t>(appProfileSize))) {
                 close(fd);
                 LOGD("Couldn't read app profile payload");
                 dexVector.clear();
@@ -640,15 +710,9 @@ private:
     nlohmann::json json;
     std::string pkgName;
     std::string vendingFingerprintValue;
-    std::string manufacturerValue;
     std::string brandValue;
-    std::string modelValue;
-    std::string productValue;
     std::string deviceValue;
-    std::string idValue;
-    std::string incrementalValue;
-    std::string typeValue;
-    std::string tagsValue;
+    std::string modelValue;
     std::string releaseValue;
     std::string securityPatchValue;
 
@@ -662,7 +726,7 @@ private:
                 json["verboseLogs"].is_string() &&
                 json["verboseLogs"] != "") {
 
-                verboseLogs = stoi(json["verboseLogs"].get<std::string>());
+                verboseLogs = parseIntOrKeep(json["verboseLogs"].get<std::string>(), verboseLogs, "verboseLogs");
 
                 if (verboseLogs > 0)
                     LOGD("Verbose logging (level %d) enabled!", verboseLogs);
@@ -678,7 +742,7 @@ private:
                 json["spoofVendingSdk"].is_string() &&
                 json["spoofVendingSdk"] != "") {
 
-                spoofVendingSdk = stoi(json["spoofVendingSdk"].get<std::string>());
+                spoofVendingSdk = parseIntOrKeep(json["spoofVendingSdk"].get<std::string>(), spoofVendingSdk, "spoofVendingSdk");
 
                 if (verboseLogs > 0)
                     LOGD(
@@ -697,7 +761,7 @@ private:
                 json["spoofPatch"].is_string() &&
                 json["spoofPatch"] != "") {
 
-                spoofPatch = stoi(json["spoofPatch"].get<std::string>());
+                spoofPatch = parseIntOrKeep(json["spoofPatch"].get<std::string>(), spoofPatch, "spoofPatch");
 
                 if (verboseLogs > 0)
                     LOGD("Spoofing Android release and security patch %s!",
@@ -727,7 +791,7 @@ private:
                            json["FINGERPRINT"] != "") {
 
                     spoofVendingFinger =
-                            stoi(json["spoofVendingFinger"].get<std::string>());
+                            parseIntOrKeep(json["spoofVendingFinger"].get<std::string>(), spoofVendingFinger, "spoofVendingFinger");
 
                     vendingFingerprintValue =
                             json["FINGERPRINT"].get<std::string>();
@@ -752,7 +816,7 @@ private:
                 json["spoofPixel"].is_string() &&
                 json["spoofPixel"] != "") {
 
-                spoofPixel = stoi(json["spoofPixel"].get<std::string>());
+                spoofPixel = parseIntOrKeep(json["spoofPixel"].get<std::string>(), spoofPixel, "spoofPixel");
 
                 if (verboseLogs > 0)
                     LOGD(
@@ -771,7 +835,7 @@ private:
                 json["spoofApps"].is_string() &&
                 json["spoofApps"] != "") {
 
-                spoofApps = stoi(json["spoofApps"].get<std::string>());
+                spoofApps = parseIntOrKeep(json["spoofApps"].get<std::string>(), spoofApps, "spoofApps");
 
                 if (verboseLogs > 0)
                     LOGD(
@@ -785,40 +849,28 @@ private:
             json.erase("spoofApps");
         }
 
-        if (json.contains("MANUFACTURER") && json["MANUFACTURER"].is_string()) {
-            manufacturerValue = json["MANUFACTURER"].get<std::string>();
-        }
+        if (json.contains("BRAND") &&
+            !json["BRAND"].is_null() &&
+            json["BRAND"].is_string() &&
+            json["BRAND"] != "") {
 
-        if (json.contains("BRAND") && json["BRAND"].is_string()) {
             brandValue = json["BRAND"].get<std::string>();
         }
 
-        if (json.contains("MODEL") && json["MODEL"].is_string()) {
-            modelValue = json["MODEL"].get<std::string>();
-        }
+        if (json.contains("DEVICE") &&
+            !json["DEVICE"].is_null() &&
+            json["DEVICE"].is_string() &&
+            json["DEVICE"] != "") {
 
-        if (json.contains("PRODUCT") && json["PRODUCT"].is_string()) {
-            productValue = json["PRODUCT"].get<std::string>();
-        }
-
-        if (json.contains("DEVICE") && json["DEVICE"].is_string()) {
             deviceValue = json["DEVICE"].get<std::string>();
         }
 
-        if (json.contains("ID") && json["ID"].is_string()) {
-            idValue = json["ID"].get<std::string>();
-        }
+        if (json.contains("MODEL") &&
+            !json["MODEL"].is_null() &&
+            json["MODEL"].is_string() &&
+            json["MODEL"] != "") {
 
-        if (json.contains("INCREMENTAL") && json["INCREMENTAL"].is_string()) {
-            incrementalValue = json["INCREMENTAL"].get<std::string>();
-        }
-
-        if (json.contains("TYPE") && json["TYPE"].is_string()) {
-            typeValue = json["TYPE"].get<std::string>();
-        }
-
-        if (json.contains("TAGS") && json["TAGS"].is_string()) {
-            tagsValue = json["TAGS"].get<std::string>();
+            modelValue = json["MODEL"].get<std::string>();
         }
 
         if (json.contains("RELEASE") && json["RELEASE"].is_string()) {
@@ -839,7 +891,7 @@ private:
                 json["spoofBuild"].is_string() &&
                 json["spoofBuild"] != "") {
 
-                spoofBuild = stoi(json["spoofBuild"].get<std::string>());
+                spoofBuild = parseIntOrKeep(json["spoofBuild"].get<std::string>(), spoofBuild, "spoofBuild");
 
                 if (verboseLogs > 0)
                     LOGD(
@@ -858,7 +910,7 @@ private:
                 json["spoofProps"].is_string() &&
                 json["spoofProps"] != "") {
 
-                spoofProps = stoi(json["spoofProps"].get<std::string>());
+                spoofProps = parseIntOrKeep(json["spoofProps"].get<std::string>(), spoofProps, "spoofProps");
 
                 if (verboseLogs > 0)
                     LOGD(
@@ -877,7 +929,7 @@ private:
                 json["spoofProvider"].is_string() &&
                 json["spoofProvider"] != "") {
 
-                spoofProvider = stoi(json["spoofProvider"].get<std::string>());
+                spoofProvider = parseIntOrKeep(json["spoofProvider"].get<std::string>(), spoofProvider, "spoofProvider");
 
                 if (verboseLogs > 0)
                     LOGD(
@@ -896,7 +948,7 @@ private:
                 json["spoofSignature"].is_string() &&
                 json["spoofSignature"] != "") {
 
-                spoofSignature = stoi(json["spoofSignature"].get<std::string>());
+                spoofSignature = parseIntOrKeep(json["spoofSignature"].get<std::string>(), spoofSignature, "spoofSignature");
 
                 if (verboseLogs > 0)
                     LOGD(
@@ -1086,7 +1138,7 @@ private:
                     env->GetStaticMethodID(
                             entryClass,
                             "init",
-                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
+                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
                     );
 
             auto javaStr =
@@ -1094,32 +1146,20 @@ private:
                             vendingFingerprintValue.c_str()
                     );
 
-            auto manufacturerStr =
-                    env->NewStringUTF(manufacturerValue.c_str());
-
             auto brandStr =
-                    env->NewStringUTF(brandValue.c_str());
-
-            auto modelStr =
-                    env->NewStringUTF(modelValue.c_str());
-
-            auto productStr =
-                    env->NewStringUTF(productValue.c_str());
+                    env->NewStringUTF(
+                            brandValue.c_str()
+                    );
 
             auto deviceStr =
-                    env->NewStringUTF(deviceValue.c_str());
+                    env->NewStringUTF(
+                            deviceValue.c_str()
+                    );
 
-            auto idStr =
-                    env->NewStringUTF(idValue.c_str());
-
-            auto incrementalStr =
-                    env->NewStringUTF(incrementalValue.c_str());
-
-            auto typeStr =
-                    env->NewStringUTF(typeValue.c_str());
-
-            auto tagsStr =
-                    env->NewStringUTF(tagsValue.c_str());
+            auto modelStr =
+                    env->NewStringUTF(
+                            modelValue.c_str()
+                    );
 
             auto releaseStr =
                     env->NewStringUTF(
@@ -1139,30 +1179,18 @@ private:
                     spoofVendingSdk,
                     javaStr,
                     spoofPixel,
-                    manufacturerStr,
                     brandStr,
-                    modelStr,
-                    productStr,
                     deviceStr,
-                    idStr,
-                    incrementalStr,
-                    typeStr,
-                    tagsStr,
+                    modelStr,
                     spoofPatch,
                     releaseStr,
                     securityPatchStr
             );
 
             env->DeleteLocalRef(javaStr);
-            env->DeleteLocalRef(manufacturerStr);
             env->DeleteLocalRef(brandStr);
-            env->DeleteLocalRef(modelStr);
-            env->DeleteLocalRef(productStr);
             env->DeleteLocalRef(deviceStr);
-            env->DeleteLocalRef(idStr);
-            env->DeleteLocalRef(incrementalStr);
-            env->DeleteLocalRef(typeStr);
-            env->DeleteLocalRef(tagsStr);
+            env->DeleteLocalRef(modelStr);
             env->DeleteLocalRef(releaseStr);
             env->DeleteLocalRef(securityPatchStr);
 
@@ -1372,117 +1400,45 @@ private:
 };
 
 static void companion(int fd) {
-    long dexSize = 0;
-    long configSize = 0;
-    long appProfileSize = 0;
-
     std::vector<char> dexVector;
     std::vector<char> configVector;
     std::vector<char> appProfileVector;
 
-    FILE *dex =
-            fopen(DEX_FILE_PATH, "rb");
+    auto loadPath = [](const char *path, std::vector<char> &buffer, size_t maxSize) -> bool {
+        FILE *file = fopen(path, "rb");
+        if (file == nullptr) return false;
+        const bool ok = readFileIntoVector(file, buffer, maxSize);
+        fclose(file);
+        if (!ok) buffer.clear();
+        return ok;
+    };
 
-    if (dex) {
-        fseek(dex, 0, SEEK_END);
-        dexSize = ftell(dex);
-        fseek(dex, 0, SEEK_SET);
-
-        dexVector.resize(dexSize);
-
-        fread(
-                dexVector.data(),
-                1,
-                dexSize,
-                dex
-        );
-
-        fclose(dex);
+    if (!loadPath(DEX_FILE_PATH, dexVector, MAX_DEX_PAYLOAD) || dexVector.empty()) {
+        LOGD("Companion: failed to read a valid dex payload");
+        dexVector.clear();
     }
 
-    FILE *config =
-            fopen(CUSTOM_PROP_FILE_PATH, "r");
+    bool configLoaded = loadPath(CUSTOM_PROP_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
+    if (!configLoaded) configLoaded = loadPath(CUSTOM_JSON_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
+    if (!configLoaded) configLoaded = loadPath(PROP_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
+    if (!configLoaded) configLoaded = loadPath(JSON_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
 
-    if (!config)
-        config = fopen(CUSTOM_JSON_FILE_PATH, "r");
-
-    if (!config)
-        config = fopen(PROP_FILE_PATH, "r");
-
-    if (!config)
-        config = fopen(JSON_FILE_PATH, "r");
-
-    if (config) {
-        fseek(config, 0, SEEK_END);
-        configSize = ftell(config);
-        fseek(config, 0, SEEK_SET);
-
-        configVector.resize(configSize);
-
-        fread(
-                configVector.data(),
-                1,
-                configSize,
-                config
-        );
-
-        fclose(config);
+    if (!loadPath(APP_PROFILE_FILE_PATH, appProfileVector, MAX_APP_PROFILE_PAYLOAD)) {
+        appProfileVector.clear();
     }
 
-    FILE *appProfile = fopen(APP_PROFILE_FILE_PATH, "rb");
+    const long dexSize = static_cast<long>(dexVector.size());
+    const long configSize = static_cast<long>(configVector.size());
+    const long appProfileSize = static_cast<long>(appProfileVector.size());
 
-    if (appProfile) {
-        fseek(appProfile, 0, SEEK_END);
-        appProfileSize = ftell(appProfile);
-        fseek(appProfile, 0, SEEK_SET);
+    const bool sent = writeFully(fd, &dexSize, sizeof(dexSize)) &&
+                      writeFully(fd, &configSize, sizeof(configSize)) &&
+                      writeFully(fd, &appProfileSize, sizeof(appProfileSize)) &&
+                      writeFully(fd, dexVector.data(), dexVector.size()) &&
+                      writeFully(fd, configVector.data(), configVector.size()) &&
+                      writeFully(fd, appProfileVector.data(), appProfileVector.size());
 
-        if (appProfileSize > 0) {
-            appProfileVector.resize(appProfileSize);
-            fread(appProfileVector.data(), 1, appProfileSize, appProfile);
-        }
-
-        fclose(appProfile);
-    }
-
-    write(
-            fd,
-            &dexSize,
-            sizeof(long)
-    );
-
-    write(
-            fd,
-            &configSize,
-            sizeof(long)
-    );
-
-    write(
-            fd,
-            &appProfileSize,
-            sizeof(long)
-    );
-
-    write(
-            fd,
-            dexVector.data(),
-            dexSize
-    );
-
-    write(
-            fd,
-            configVector.data(),
-            configSize
-    );
-
-    write(
-            fd,
-            appProfileVector.data(),
-            appProfileSize
-    );
-
-    dexVector.clear();
-    configVector.clear();
-    appProfileVector.clear();
+    if (!sent) LOGD("Companion: failed to send complete payload to Zygisk process");
 }
 
 REGISTER_ZYGISK_MODULE(PlayIntegrityFix)
