@@ -14,6 +14,7 @@
 #endif
 
 #include <map>
+#include <mutex>
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -119,6 +120,38 @@ static bool readFileIntoVector(FILE *file, std::vector<char> &out, size_t maxSiz
         out.clear();
         return false;
     }
+    return true;
+}
+
+// These profiles are immutable for the lifetime of the companion process. Cache
+// only successful reads so a temporarily missing file can be retried later.
+static std::mutex profileCacheMutex;
+static std::vector<char> appProfileCache;
+static std::vector<char> photosProfileCache;
+static bool appProfileCacheReady = false;
+static bool photosProfileCacheReady = false;
+
+static bool loadCachedProfile(const char *path, std::vector<char> &cache,
+                              bool &cacheReady, std::vector<char> &out,
+                              size_t maxSize) {
+    std::lock_guard<std::mutex> lock(profileCacheMutex);
+    if (!cacheReady) {
+        FILE *file = fopen(path, "rb");
+        if (file == nullptr) return false;
+
+        std::vector<char> loaded;
+        const bool ok = readFileIntoVector(file, loaded, maxSize);
+        fclose(file);
+        if (!ok) return false;
+
+        cache.swap(loaded);
+        cacheReady = true;
+        LOGD("Cached immutable profile: %s; bytes=%d", path,
+             static_cast<int>(cache.size()));
+    }
+
+    // Keep each request's payload independent while avoiding repeated file I/O.
+    out = cache;
     return true;
 }
 
@@ -1671,14 +1704,20 @@ static void companion(int fd) {
          configSource ? configSource : "none", configLoaded ? 1 : 0,
          static_cast<int>(configVector.size()));
 
-    if (!loadPath(APP_PROFILE_FILE_PATH, appProfileVector, MAX_APP_PROFILE_PAYLOAD)) {
+    if (!loadCachedProfile(APP_PROFILE_FILE_PATH, appProfileCache,
+                           appProfileCacheReady, appProfileVector,
+                           MAX_APP_PROFILE_PAYLOAD)) {
         appProfileVector.clear();
+        LOGD("Companion: couldn't load app profile: %s", APP_PROFILE_FILE_PATH);
     }
-    const bool photosConfigLoaded = loadPath(PHOTOS_PROP_FILE_PATH, photosConfigVector, MAX_CONFIG_PAYLOAD);
-    if (!photosConfigLoaded) photosConfigVector.clear();
-    LOGD("Photos profile source: %s; loaded=%d; bytes=%d",
-         PHOTOS_PROP_FILE_PATH, photosConfigLoaded ? 1 : 0,
-         static_cast<int>(photosConfigVector.size()));
+
+    const bool photosConfigLoaded = loadCachedProfile(
+            PHOTOS_PROP_FILE_PATH, photosProfileCache, photosProfileCacheReady,
+            photosConfigVector, MAX_CONFIG_PAYLOAD);
+    if (!photosConfigLoaded) {
+        photosConfigVector.clear();
+        LOGD("Companion: couldn't load Photos profile: %s", PHOTOS_PROP_FILE_PATH);
+    }
 
     const long dexSize = static_cast<long>(dexVector.size());
     const long configSize = static_cast<long>(configVector.size());
