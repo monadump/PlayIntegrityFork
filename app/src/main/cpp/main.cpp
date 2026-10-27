@@ -136,17 +136,34 @@ static bool loadCachedProfile(const char *path, std::vector<char> &cache,
                               size_t maxSize) {
     std::lock_guard<std::mutex> lock(profileCacheMutex);
     if (!cacheReady) {
+        LOGD("PROFILE CACHE MISS: %s; reading from disk", path);
+        errno = 0;
         FILE *file = fopen(path, "rb");
-        if (file == nullptr) return false;
+        if (file == nullptr) {
+            const int error = errno;
+            LOGD("PROFILE DISK OPEN FAILED: %s; errno=%d (%s)", path,
+                 error, strerror(error));
+            return false;
+        }
 
         std::vector<char> loaded;
         const bool ok = readFileIntoVector(file, loaded, maxSize);
+        const int readError = errno;
         fclose(file);
-        if (!ok) return false;
+        if (!ok) {
+            LOGD("PROFILE DISK READ FAILED: %s; errno=%d (%s)", path,
+                 readError, strerror(readError));
+            return false;
+        }
 
         cache.swap(loaded);
         cacheReady = true;
-        LOGD("Cached immutable profile: %s; bytes=%d", path,
+        LOGD("PROFILE DISK READ SUCCESS: %s; bytes=%d", path,
+             static_cast<int>(cache.size()));
+        LOGD("PROFILE CACHE POPULATED: %s; bytes=%d", path,
+             static_cast<int>(cache.size()));
+    } else {
+        LOGD("PROFILE CACHE HIT: %s; bytes=%d; no disk read", path,
              static_cast<int>(cache.size()));
     }
 
