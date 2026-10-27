@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────
+# BUILD IDENTITY
+# ─────────────────────────────────────────────
+ro.build.id=BQ2A.250525.001
+ro.build.display.id=36.0810.1810.86
+ro.build.version.incremental=36.0810.1810.86
+
+ro.build.type=user
+ro.build.user=root
+ro.build.host=meowna
+ro.build.tags=release-keys
+ro.build.flavor=I005D-user
+
+ro.build.fingerprint=asus/TJAI2501/ASUSAI2501:16/BQ2A.250525.001/36.0810.1810.86:user/release-keys
+ro.build.description=I005D-user 16 BQ2A.250525.001 36.0810.1810.86 release-keys
+ro.build.product=AI2501
+ro.build.characteristics=default
+
+ro.build.date=Thu Oct 8 00:07:04 UTC 2026
+ro.build.date.utc=1707351026
+ro.build.thumbprint=
+
+# ─────────────────────────────────────────────
+# ANDROID VERSION
+# ─────────────────────────────────────────────
+ro.build.version.release=16
+ro.build.version.sdk=36
+ro.build.version.preview_sdk=0
+ro.build.version.codename=REL
+ro.build.version.all_codenames=REL
+ro.build.version.security_patch=2026-05-01
+ro.build.version.base_os=
+
+# ─────────────────────────────────────────────
+# PRODUCT / DEVICE
+# ─────────────────────────────────────────────
+
+ro.product.brand=asus
+ro.product.name=ASUSAI2501
+ro.product.model=ASUS_AI2501
+ro.product.device=AI2501
+ro.product.manufacturer=asus
+ro.product.board=kalama
+
+# ─────────────────────────────────────────────
+# HARDWARE / SOC
+# ─────────────────────────────────────────────
+ro.hardware=qcom
+ro.board.platform=kalama
+ro.soc.manufacturer=Qualcomm
+ro.soc.model=SM8750
