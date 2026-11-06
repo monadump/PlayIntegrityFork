@@ -24,7 +24,6 @@
 #include <cstring>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF/Native", __VA_ARGS__)
@@ -176,43 +175,6 @@ static bool loadCachedProfile(const char *path, std::vector<char> &cache,
 static constexpr size_t MAX_DEX_PAYLOAD = 64U * 1024U * 1024U;
 static constexpr size_t MAX_CONFIG_PAYLOAD = 16U * 1024U * 1024U;
 static constexpr size_t MAX_APP_PROFILE_PAYLOAD = 16U * 1024U * 1024U;
-
-
-static bool clearJniException(JNIEnv *env, const char *stage) {
-    if (env != nullptr && env->ExceptionCheck()) {
-        LOGD("JNI: exception during %s; aborting this injection step", stage);
-        env->ExceptionClear();
-        return true;
-    }
-    return false;
-}
-
-static bool jniFailed(JNIEnv *env, bool failed, const char *stage) {
-    const bool exception = clearJniException(env, stage);
-    if (failed && !exception) LOGD("JNI: operation returned null/failed during %s", stage);
-    return failed || exception;
-}
-
-class ScopedLocalFrame {
-public:
-    explicit ScopedLocalFrame(JNIEnv *env, jint capacity) : env_(env) {
-        active_ = env_ != nullptr && env_->PushLocalFrame(capacity) == JNI_OK;
-        if (!active_) clearJniException(env_, "PushLocalFrame");
-    }
-
-    ~ScopedLocalFrame() {
-        if (active_) env_->PopLocalFrame(nullptr);
-    }
-
-    ScopedLocalFrame(const ScopedLocalFrame &) = delete;
-    ScopedLocalFrame &operator=(const ScopedLocalFrame &) = delete;
-
-    bool valid() const { return active_; }
-
-private:
-    JNIEnv *env_;
-    bool active_ = false;
-};
 
 #if defined(__aarch64__) || defined(__arm__)
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
@@ -501,6 +463,36 @@ static bool loadAppProfile() {
     return !appJsonProps.empty();
 }
 
+static bool checkJniException(JNIEnv *env, const char *stage) {
+    if (env != nullptr && env->ExceptionCheck()) {
+        LOGD("JNI: exception during %s; aborting this operation", stage);
+        env->ExceptionClear();
+        return true;
+    }
+    return false;
+}
+
+class ScopedLocalFrame {
+public:
+    explicit ScopedLocalFrame(JNIEnv *env, jint capacity) : env_(env) {
+        active_ = env_ != nullptr && env_->PushLocalFrame(capacity) == JNI_OK;
+        if (!active_) checkJniException(env_, "PushLocalFrame");
+    }
+
+    ~ScopedLocalFrame() {
+        if (active_) env_->PopLocalFrame(nullptr);
+    }
+
+    ScopedLocalFrame(const ScopedLocalFrame &) = delete;
+    ScopedLocalFrame &operator=(const ScopedLocalFrame &) = delete;
+
+    bool valid() const { return active_; }
+
+private:
+    JNIEnv *env_;
+    bool active_ = false;
+};
+
 static void setFieldNative(
         JNIEnv *env,
         jclass /* clazz_EntryPoint */,
@@ -509,18 +501,24 @@ static void setFieldNative(
         jstring typeObj,
         jobject valueObj) {
 
-    if (env == nullptr || !targetClass || !fieldObj || !typeObj || !valueObj) return;
+    if (env == nullptr || !targetClass || !fieldObj || !typeObj) return;
 
     jfieldID fieldID = env->FromReflectedField(fieldObj);
-    if (jniFailed(env, fieldID == nullptr, "FromReflectedField")) return;
+    if (checkJniException(env, "FromReflectedField") || fieldID == nullptr) return;
 
     const char *typeName = env->GetStringUTFChars(typeObj, nullptr);
-    if (jniFailed(env, typeName == nullptr, "GetStringUTFChars")) return;
+    if (checkJniException(env, "GetStringUTFChars") || typeName == nullptr) return;
 
-    if (strcmp(typeName, "java.lang.String") == 0 ||
-        strcmp(typeName, "[Ljava.lang.String;") == 0) {
-        env->SetStaticObjectField(targetClass, fieldID, valueObj);
-    } else {
+    jclass wrapperClass = nullptr;
+    do {
+        if (strcmp(typeName, "java.lang.String") == 0 ||
+            strcmp(typeName, "[Ljava.lang.String;") == 0) {
+            env->SetStaticObjectField(targetClass, fieldID, valueObj);
+            break;
+        }
+
+        if (valueObj == nullptr) break;
+
         const char *wrapperName = nullptr;
         const char *methodName = nullptr;
         const char *signature = nullptr;
@@ -536,80 +534,64 @@ static void setFieldNative(
             wrapperName = "java/lang/Boolean";
             methodName = "booleanValue";
             signature = "()Z";
+        } else {
+            break;
         }
 
-        if (wrapperName != nullptr) {
-            jclass wrapperClass = env->FindClass(wrapperName);
-            if (!jniFailed(env, wrapperClass == nullptr, "FindClass(wrapper)")) {
-                jmethodID unbox = env->GetMethodID(wrapperClass, methodName, signature);
-                if (!jniFailed(env, unbox == nullptr, "GetMethodID(unbox)")) {
-                    if (strcmp(typeName, "int") == 0) {
-                        const jint value = env->CallIntMethod(valueObj, unbox);
-                        if (!clearJniException(env, "Integer.intValue"))
-                            env->SetStaticIntField(targetClass, fieldID, value);
-                    } else if (strcmp(typeName, "long") == 0) {
-                        const jlong value = env->CallLongMethod(valueObj, unbox);
-                        if (!clearJniException(env, "Long.longValue"))
-                            env->SetStaticLongField(targetClass, fieldID, value);
-                    } else {
-                        const jboolean value = env->CallBooleanMethod(valueObj, unbox);
-                        if (!clearJniException(env, "Boolean.booleanValue"))
-                            env->SetStaticBooleanField(targetClass, fieldID, value);
-                    }
-                }
-            }
-        }
-    }
+        wrapperClass = env->FindClass(wrapperName);
+        if (checkJniException(env, "FindClass(wrapper)") || wrapperClass == nullptr) break;
 
-    clearJniException(env, "SetStaticField");
+        jmethodID unboxMethod = env->GetMethodID(wrapperClass, methodName, signature);
+        if (checkJniException(env, "GetMethodID(unbox)") || unboxMethod == nullptr) break;
+
+        if (strcmp(typeName, "int") == 0) {
+            jint value = env->CallIntMethod(valueObj, unboxMethod);
+            if (!checkJniException(env, "Integer.intValue"))
+                env->SetStaticIntField(targetClass, fieldID, value);
+        } else if (strcmp(typeName, "long") == 0) {
+            jlong value = env->CallLongMethod(valueObj, unboxMethod);
+            if (!checkJniException(env, "Long.longValue"))
+                env->SetStaticLongField(targetClass, fieldID, value);
+        } else {
+            jboolean value = env->CallBooleanMethod(valueObj, unboxMethod);
+            if (!checkJniException(env, "Boolean.booleanValue"))
+                env->SetStaticBooleanField(targetClass, fieldID, value);
+        }
+    } while (false);
+
+    checkJniException(env, "SetStaticField");
+    if (wrapperClass != nullptr) env->DeleteLocalRef(wrapperClass);
     env->ReleaseStringUTFChars(typeObj, typeName);
 }
 
-static std::string trimConfigValue(std::string value) {
-    const size_t first = value.find_first_not_of(" \t\r");
-    if (first == std::string::npos) return {};
-    const size_t last = value.find_last_not_of(" \t\r");
-    return value.substr(first, last - first + 1);
-}
+static std::string propToJson(std::string configString) {
+    if (nlohmann::json::accept(configString, true)) return configString;
 
-// Accept both JSON objects and .prop files. Build JSON through the library so
-// quotes, backslashes and other special characters are escaped correctly.
-static nlohmann::json parseConfigText(const std::string &input, const char *source) {
-    auto parsed = nlohmann::json::parse(input, nullptr, false, true);
-    if (!parsed.is_discarded()) {
-        if (parsed.is_object()) return parsed;
-        LOGD("%s config is valid JSON but is not an object", source);
-        return nlohmann::json::object();
-    }
-
-    nlohmann::json properties = nlohmann::json::object();
-    size_t begin = 0;
-    while (begin < input.size()) {
-        size_t end = input.find('\n', begin);
-        if (end == std::string::npos) end = input.size();
-
-        std::string line = input.substr(begin, end - begin);
-        begin = end == input.size() ? input.size() : end + 1;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-
-        const std::string trimmed = trimConfigValue(line);
-        if (trimmed.empty() || trimmed.front() == '#') continue;
+    configString.erase(std::remove(configString.begin(), configString.end(), '\r'), configString.end());
+    std::string jsonString = "{";
+    size_t beginPos = 0;
+    while (beginPos < configString.size()) {
+        size_t endPos = configString.find('\n', beginPos);
+        std::string line = endPos == std::string::npos
+                ? configString.substr(beginPos)
+                : configString.substr(beginPos, endPos - beginPos);
+        beginPos = endPos == std::string::npos ? configString.size() : endPos + 1;
+        if (line.empty() || line[0] == '#') continue;
 
         const size_t delimiter = line.find('=');
         if (delimiter == std::string::npos) continue;
-
-        std::string name = trimConfigValue(line.substr(0, delimiter));
+        std::string name = line.substr(0, delimiter);
         std::string value = line.substr(delimiter + 1);
         const size_t comment = value.find('#');
         if (comment != std::string::npos) value.resize(comment);
-        value = trimConfigValue(std::move(value));
-        if (!name.empty() && !value.empty()) properties[name] = std::move(value);
+        const size_t last = value.find_last_not_of(" \t");
+        value = last == std::string::npos ? "" : value.substr(0, last + 1);
+        if (value.empty()) continue;
+        jsonString += "\n\"" + name + "\": \"" + value + "\",";
     }
-
-    if (properties.empty()) {
-        LOGD("%s config could not be parsed as JSON or .prop data", source);
-    }
-    return properties;
+    if (!jsonString.empty() && jsonString.back() == ',') jsonString.pop_back();
+    jsonString += "\n}\n";
+    return jsonString;
 }
 
 static bool hasUppercase(const std::string &value) {
@@ -820,10 +802,67 @@ public:
         close(fd);
 
         std::string configString(configVector.cbegin(), configVector.cend());
-        json = parseConfigText(configString, "Main");
-        if (!json.is_object() || json.empty()) {
-            LOGD("Main config is empty or invalid; disabling injection for this process");
+
+        if (!nlohmann::json::accept(configString, true)) {
+            LOGD("Converting config from prop format to JSON format");
+
+            configString.erase(
+                    std::remove(configString.begin(), configString.end(), '\r'),
+                    configString.end()
+            );
+
+            std::string jsonString = "{";
+
+            char propDelimiter = '=';
+            char commentDelimiter = '#';
+
+            size_t beginPos = 0;
+            size_t endPos = 0;
+
+            while ((endPos = configString.find('\n', beginPos)) != std::string::npos) {
+                std::string line = configString.substr(beginPos, endPos - beginPos);
+                beginPos = endPos + 1;
+
+                if (line.empty() || line[0] == '#')
+                    continue;
+
+                std::string name;
+                std::string value;
+
+                size_t propDelimiterPos = line.find(propDelimiter);
+
+                if (propDelimiterPos != std::string::npos) {
+                    name = line.substr(0, propDelimiterPos);
+                    value = line.substr(propDelimiterPos + 1);
+                } else {
+                    LOGD("Invalid prop entry, skipping");
+                    continue;
+                }
+
+                size_t commentDelimiterPos = value.find(commentDelimiter);
+
+                if (commentDelimiterPos != std::string::npos) {
+                    value = value.substr(0, commentDelimiterPos);
+
+                    size_t lastPos = value.find_last_not_of(" ");
+
+                    if (lastPos != std::string::npos)
+                        value.resize(lastPos + 1);
+                }
+
+                jsonString += "\n\"" + name + "\": \"" + value + "\",";
+            }
+
+            if (!jsonString.empty() && jsonString.back() == ',')
+                jsonString.pop_back();
+
+            jsonString += "\n}\n";
+
+            configString = jsonString;
+            jsonString.clear();
         }
+
+        json = nlohmann::json::parse(configString, nullptr, false, true);
 
         configVector.clear();
         configString.clear();
@@ -855,7 +894,8 @@ public:
         // retaining its JSON allocations in GMS, Play Store, and other target apps.
         if (pkgName == PHOTOS_PACKAGE && !photosConfigVector.empty()) {
             std::string photosString(photosConfigVector.begin(), photosConfigVector.end());
-            photosJson = parseConfigText(photosString, "Photos");
+            photosJson = nlohmann::json::parse(propToJson(photosString), nullptr, false, true);
+            if (photosJson.is_discarded()) photosJson.clear();
         }
         // Release the payload buffer in every process; clear() alone retains capacity.
         std::vector<char>().swap(photosConfigVector);
@@ -1238,197 +1278,546 @@ private:
         }
     }
 
-    jclass loadEntryClass(const char *className, const char *niceName) {
-        if (dexVector.empty()) {
-            LOGD("JNI %s: DEX payload is empty", niceName);
-            return nullptr;
-        }
-
-        jclass classLoaderClass = env->FindClass("java/lang/ClassLoader");
-        if (jniFailed(env, classLoaderClass == nullptr, "FindClass(ClassLoader)")) return nullptr;
-
-        jmethodID getSystemClassLoader = env->GetStaticMethodID(
-                classLoaderClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
-        if (jniFailed(env, getSystemClassLoader == nullptr, "getSystemClassLoader lookup")) return nullptr;
-
-        jobject systemClassLoader = env->CallStaticObjectMethod(classLoaderClass, getSystemClassLoader);
-        if (jniFailed(env, systemClassLoader == nullptr, "getSystemClassLoader call")) return nullptr;
-
-        jclass dexClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-        if (jniFailed(env, dexClass == nullptr, "FindClass(InMemoryDexClassLoader)")) return nullptr;
-
-        jmethodID dexConstructor = env->GetMethodID(
-                dexClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-        if (jniFailed(env, dexConstructor == nullptr, "InMemoryDexClassLoader constructor lookup")) return nullptr;
-
-        jobject buffer = env->NewDirectByteBuffer(dexVector.data(), static_cast<jlong>(dexVector.size()));
-        if (jniFailed(env, buffer == nullptr, "NewDirectByteBuffer")) return nullptr;
-
-        jobject dexClassLoader = env->NewObject(dexClass, dexConstructor, buffer, systemClassLoader);
-        if (jniFailed(env, dexClassLoader == nullptr, "InMemoryDexClassLoader construction")) return nullptr;
-
-        jmethodID loadClass = env->GetMethodID(
-                classLoaderClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
-        if (jniFailed(env, loadClass == nullptr, "ClassLoader.loadClass lookup")) return nullptr;
-
-        jstring classNameString = env->NewStringUTF(className);
-        if (jniFailed(env, classNameString == nullptr, "NewStringUTF(class name)")) return nullptr;
-
-        jobject entryClass = env->CallObjectMethod(dexClassLoader, loadClass, classNameString);
-        if (jniFailed(env, entryClass == nullptr, "ClassLoader.loadClass call")) {
-            LOGD("JNI %s: Could not load %s", niceName, className);
-            return nullptr;
-        }
-
-        return static_cast<jclass>(entryClass);
-    }
-
-    bool registerEntryNatives(jclass entryClass, const char *niceName) {
-        JNINativeMethod methods[] = {{
-                "setFieldNative",
-                "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V",
-                reinterpret_cast<void *>(setFieldNative)
-        }};
-        const jint result = env->RegisterNatives(entryClass, methods, 1);
-        const bool exception = clearJniException(env, "RegisterNatives");
-        if (result != JNI_OK || exception) {
-            LOGD("JNI %s: Native method registration failed; skipping injection", niceName);
-            return false;
-        }
-        return true;
-    }
-
     void inject() {
-        const char *niceName = pkgName == VENDING_PACKAGE ? "PS" : "DG";
-        const char *className = pkgName == VENDING_PACKAGE
+        ScopedLocalFrame localFrame(env, 64);
+        if (!localFrame.valid() || dexVector.empty()) {
+            LOGD("JNI: unable to allocate local frame or module DEX is empty; skipping injection");
+            return;
+        }
+
+        const char *niceName =
+                pkgName == VENDING_PACKAGE ? "PS" : "DG";
+
+        LOGD("JNI %s: Getting system classloader", niceName);
+
+        auto clClass =
+                env->FindClass("java/lang/ClassLoader");
+        if (checkJniException(env, "FindClass(ClassLoader)") || clClass == nullptr) return;
+
+        auto getSystemClassLoader =
+                env->GetStaticMethodID(
+                        clClass,
+                        "getSystemClassLoader",
+                        "()Ljava/lang/ClassLoader;"
+                );
+        if (checkJniException(env, "getSystemClassLoader lookup") || getSystemClassLoader == nullptr) return;
+
+        auto systemClassLoader =
+                env->CallStaticObjectMethod(
+                        clClass,
+                        getSystemClassLoader
+                );
+        if (checkJniException(env, "getSystemClassLoader call") || systemClassLoader == nullptr) return;
+
+        LOGD("JNI %s: Creating module classloader", niceName);
+
+        auto dexClClass =
+                env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        if (checkJniException(env, "FindClass(InMemoryDexClassLoader)") || dexClClass == nullptr) return;
+
+        auto dexClInit =
+                env->GetMethodID(
+                        dexClClass,
+                        "<init>",
+                        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"
+                );
+        if (checkJniException(env, "InMemoryDexClassLoader constructor lookup") || dexClInit == nullptr) return;
+
+        auto buffer =
+                env->NewDirectByteBuffer(
+                        dexVector.data(),
+                        static_cast<jlong>(dexVector.size())
+                );
+        if (checkJniException(env, "NewDirectByteBuffer") || buffer == nullptr) return;
+
+        auto dexCl =
+                env->NewObject(
+                        dexClClass,
+                        dexClInit,
+                        buffer,
+                        systemClassLoader
+                );
+        if (checkJniException(env, "NewObject(InMemoryDexClassLoader)") || dexCl == nullptr) return;
+
+        LOGD("JNI %s: Loading module class", niceName);
+
+        auto loadClass =
+                env->GetMethodID(
+                        clClass,
+                        "loadClass",
+                        "(Ljava/lang/String;)Ljava/lang/Class;"
+                );
+        if (checkJniException(env, "ClassLoader.loadClass lookup") || loadClass == nullptr) return;
+
+        const char *className =
+                pkgName == VENDING_PACKAGE
                 ? "es.chiteroman.playintegrityfix.EntryPointVending"
                 : "es.chiteroman.playintegrityfix.EntryPoint";
 
-        ScopedLocalFrame localFrame(env, 64);
-        if (!localFrame.valid()) return;
+        auto entryClassName =
+                env->NewStringUTF(className);
+        if (checkJniException(env, "NewStringUTF(className)") || entryClassName == nullptr) return;
 
-        LOGD("JNI %s: Loading %s", niceName, className);
-        jclass entryClass = loadEntryClass(className, niceName);
-        if (entryClass == nullptr || !registerEntryNatives(entryClass, niceName)) return;
+        auto entryClassObj =
+                env->CallObjectMethod(
+                        dexCl,
+                        loadClass,
+                        entryClassName
+                );
+
+        if (env->ExceptionCheck()) {
+            LOGD(
+                    "JNI %s: Exception while loading class '%s', clearing and aborting injection",
+                    niceName,
+                    className
+            );
+
+            env->ExceptionClear();
+
+            env->DeleteLocalRef(clClass);
+            env->DeleteLocalRef(systemClassLoader);
+            env->DeleteLocalRef(dexClClass);
+            env->DeleteLocalRef(buffer);
+            env->DeleteLocalRef(dexCl);
+            env->DeleteLocalRef(entryClassName);
+
+            return;
+        }
+
+        if (entryClassObj == nullptr) {
+            LOGD(
+                    "JNI %s: loadClass('%s') returned null, aborting injection",
+                    niceName,
+                    className
+            );
+
+            env->DeleteLocalRef(clClass);
+            env->DeleteLocalRef(systemClassLoader);
+            env->DeleteLocalRef(dexClClass);
+            env->DeleteLocalRef(buffer);
+            env->DeleteLocalRef(dexCl);
+            env->DeleteLocalRef(entryClassName);
+
+            return;
+        }
+
+        auto entryClass =
+                (jclass) entryClassObj;
+
+        JNINativeMethod methods[] = {
+            {
+                "setFieldNative",
+                "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V",
+                (void *) setFieldNative
+            }
+        };
+
+        const jint registerResult = env->RegisterNatives(
+                entryClass,
+                methods,
+                1
+        );
+        if (checkJniException(env, "RegisterNatives") || registerResult != JNI_OK) {
+            LOGD("JNI %s: native method registration failed; skipping injection", niceName);
+            return;
+        }
 
         if (pkgName == VENDING_PACKAGE) {
-            const char *signature =
-                    "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;"
-                    "Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
-                    "Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V";
-            jmethodID entryInit = env->GetStaticMethodID(entryClass, "init", signature);
-            if (jniFailed(env, entryInit == nullptr, "EntryPointVending.init lookup")) {
-                LOGD("JNI PS: EntryPointVending.init is unavailable; skipping injection");
-                return;
-            }
+            LOGD(
+                    "JNI %s: Calling EntryPointVending.init",
+                    niceName
+            );
 
-            const std::string *argumentValues[] = {
-                    &vendingFingerprintValue, &manufacturerValue, &brandValue,
-                    &modelValue, &productValue, &deviceValue, &idValue,
-                    &incrementalValue, &typeValue, &tagsValue,
-                    &releaseValue, &securityPatchValue
-            };
-            jstring strings[12] = {};
-            for (size_t i = 0; i < 12; ++i) {
-                strings[i] = env->NewStringUTF(argumentValues[i]->c_str());
-                if (jniFailed(env, strings[i] == nullptr, "NewStringUTF(Play Store argument)")) {
-                    LOGD("JNI PS: Could not allocate Java arguments; skipping injection");
-                    return;
-                }
+            auto entryInit =
+                    env->GetStaticMethodID(
+                            entryClass,
+                            "init",
+                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
+                    );
+
+            if (entryInit == nullptr || env->ExceptionCheck()) {
+                LOGD("JNI %s: EntryPointVending.init method lookup failed; skipping injection", niceName);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            } else {
+            auto javaStr =
+                    env->NewStringUTF(
+                            vendingFingerprintValue.c_str()
+                    );
+
+            auto manufacturerStr =
+                    env->NewStringUTF(manufacturerValue.c_str());
+
+            auto brandStr =
+                    env->NewStringUTF(brandValue.c_str());
+
+            auto modelStr =
+                    env->NewStringUTF(modelValue.c_str());
+
+            auto productStr =
+                    env->NewStringUTF(productValue.c_str());
+
+            auto deviceStr =
+                    env->NewStringUTF(deviceValue.c_str());
+
+            auto idStr =
+                    env->NewStringUTF(idValue.c_str());
+
+            auto incrementalStr =
+                    env->NewStringUTF(incrementalValue.c_str());
+
+            auto typeStr =
+                    env->NewStringUTF(typeValue.c_str());
+
+            auto tagsStr =
+                    env->NewStringUTF(tagsValue.c_str());
+
+            auto releaseStr =
+                    env->NewStringUTF(releaseValue.c_str());
+
+            auto securityPatchStr =
+                    env->NewStringUTF(securityPatchValue.c_str());
+
+            if (checkJniException(env, "Play Store argument allocation") ||
+                javaStr == nullptr || manufacturerStr == nullptr || brandStr == nullptr ||
+                modelStr == nullptr || productStr == nullptr || deviceStr == nullptr ||
+                idStr == nullptr || incrementalStr == nullptr || typeStr == nullptr ||
+                tagsStr == nullptr || releaseStr == nullptr || securityPatchStr == nullptr) {
+                LOGD("JNI PS: failed to allocate initialization arguments; skipping injection");
+                return;
             }
 
             env->CallStaticVoidMethod(
-                    entryClass, entryInit,
-                    verboseLogs, spoofVendingFinger, spoofVendingSdk,
-                    strings[0], spoofPixel,
-                    strings[1], strings[2], strings[3], strings[4], strings[5],
-                    strings[6], strings[7], strings[8], strings[9],
-                    spoofPatch, strings[10], strings[11]);
-            if (clearJniException(env, "EntryPointVending.init call")) {
-                LOGD("JNI PS: Java initialization failed; Play Store spoofing was not fully applied");
+                    entryClass,
+                    entryInit,
+                    verboseLogs,
+                    spoofVendingFinger,
+                    spoofVendingSdk,
+                    javaStr,
+                    spoofPixel,
+                    manufacturerStr,
+                    brandStr,
+                    modelStr,
+                    productStr,
+                    deviceStr,
+                    idStr,
+                    incrementalStr,
+                    typeStr,
+                    tagsStr,
+                    spoofPatch,
+                    releaseStr,
+                    securityPatchStr
+            );
+            checkJniException(env, "EntryPointVending.init call");
+
+            env->DeleteLocalRef(javaStr);
+            env->DeleteLocalRef(manufacturerStr);
+            env->DeleteLocalRef(brandStr);
+            env->DeleteLocalRef(modelStr);
+            env->DeleteLocalRef(productStr);
+            env->DeleteLocalRef(deviceStr);
+            env->DeleteLocalRef(idStr);
+            env->DeleteLocalRef(incrementalStr);
+            env->DeleteLocalRef(typeStr);
+            env->DeleteLocalRef(tagsStr);
+            env->DeleteLocalRef(releaseStr);
+            env->DeleteLocalRef(securityPatchStr);
+            }
+        } else {
+            LOGD(
+                    "JNI %s: Sending JSON",
+                    niceName
+            );
+
+            auto receiveJson =
+                    env->GetStaticMethodID(
+                            entryClass,
+                            "receiveJson",
+                            "(Ljava/lang/String;)V"
+                    );
+
+            if (checkJniException(env, "EntryPoint.receiveJson lookup") || receiveJson == nullptr) {
+                LOGD("JNI DG: EntryPoint.receiveJson lookup failed; skipping injection");
                 return;
             }
-            LOGD("JNI PS: EntryPointVending.init completed");
-            return;
+
+            auto javaStr =
+                    env->NewStringUTF(
+                            json.dump().c_str()
+                    );
+            if (checkJniException(env, "EntryPoint JSON allocation") || javaStr == nullptr) return;
+
+            env->CallStaticVoidMethod(
+                    entryClass,
+                    receiveJson,
+                    javaStr
+            );
+            if (checkJniException(env, "EntryPoint.receiveJson call")) return;
+
+            LOGD(
+                    "JNI %s: Calling EntryPoint.init",
+                    niceName
+            );
+
+            auto entryInit =
+                    env->GetStaticMethodID(
+                            entryClass,
+                            "init",
+                            "(IIII)V"
+                    );
+            if (checkJniException(env, "EntryPoint.init lookup") || entryInit == nullptr) return;
+
+            env->CallStaticVoidMethod(
+                    entryClass,
+                    entryInit,
+                    verboseLogs,
+                    spoofBuild,
+                    spoofProvider,
+                    spoofSignature
+            );
+            checkJniException(env, "EntryPoint.init call");
+
+            env->DeleteLocalRef(javaStr);
         }
 
-        jmethodID receiveJson = env->GetStaticMethodID(
-                entryClass, "receiveJson", "(Ljava/lang/String;)V");
-        if (jniFailed(env, receiveJson == nullptr, "EntryPoint.receiveJson lookup")) return;
-
-        const std::string jsonText = json.dump();
-        jstring jsonString = env->NewStringUTF(jsonText.c_str());
-        if (jniFailed(env, jsonString == nullptr, "NewStringUTF(DroidGuard JSON)")) return;
-
-        env->CallStaticVoidMethod(entryClass, receiveJson, jsonString);
-        if (clearJniException(env, "EntryPoint.receiveJson call")) return;
-
-        jmethodID entryInit = env->GetStaticMethodID(entryClass, "init", "(IIII)V");
-        if (jniFailed(env, entryInit == nullptr, "EntryPoint.init lookup")) return;
-
-        env->CallStaticVoidMethod(entryClass, entryInit,
-                                  verboseLogs, spoofBuild, spoofProvider, spoofSignature);
-        if (clearJniException(env, "EntryPoint.init call")) {
-            LOGD("JNI DG: EntryPoint.init failed");
-            return;
-        }
-        LOGD("JNI DG: EntryPoint.init completed");
+        env->DeleteLocalRef(clClass);
+        env->DeleteLocalRef(systemClassLoader);
+        env->DeleteLocalRef(dexClClass);
+        env->DeleteLocalRef(buffer);
+        env->DeleteLocalRef(dexCl);
+        env->DeleteLocalRef(entryClassName);
+        env->DeleteLocalRef(entryClassObj);
     }
 
     void injectPhotos() {
         ScopedLocalFrame localFrame(env, 48);
-        if (!localFrame.valid()) return;
-
-        const char *className = "es.chiteroman.playintegrityfix.EntryPointPhotos";
-        jclass entryClass = loadEntryClass(className, "PHOTOS");
-        if (entryClass == nullptr || !registerEntryNatives(entryClass, "PHOTOS")) return;
-
-        jmethodID receiveJson = env->GetStaticMethodID(
-                entryClass, "receiveJson", "(Ljava/lang/String;)V");
-        if (jniFailed(env, receiveJson == nullptr, "EntryPointPhotos.receiveJson lookup")) return;
-
-        const std::string jsonText = photosJson.dump();
-        jstring jsonString = env->NewStringUTF(jsonText.c_str());
-        if (jniFailed(env, jsonString == nullptr, "NewStringUTF(Photos JSON)")) return;
-
-        env->CallStaticVoidMethod(entryClass, receiveJson, jsonString);
-        if (clearJniException(env, "EntryPointPhotos.receiveJson call")) return;
-
-        jmethodID entryInit = env->GetStaticMethodID(entryClass, "init", "(III)V");
-        if (jniFailed(env, entryInit == nullptr, "EntryPointPhotos.init lookup")) return;
-
-        env->CallStaticVoidMethod(entryClass, entryInit, verboseLogs, 1, 1);
-        if (clearJniException(env, "EntryPointPhotos.init call")) {
-            LOGD("JNI PHOTOS: EntryPointPhotos.init failed");
+        if (!localFrame.valid() || dexVector.empty()) {
+            LOGD("JNI PHOTOS: unable to allocate local frame or module DEX is empty; skipping injection");
             return;
         }
-        LOGD("JNI PHOTOS: EntryPointPhotos.init completed");
+
+        auto clClass = env->FindClass("java/lang/ClassLoader");
+        if (!clClass) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
+        auto getSystemClassLoader = env->GetStaticMethodID(clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+        if (checkJniException(env, "PHOTOS getSystemClassLoader lookup") || getSystemClassLoader == nullptr) return;
+        auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
+        if (checkJniException(env, "PHOTOS getSystemClassLoader call") || systemClassLoader == nullptr) return;
+        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        if (checkJniException(env, "PHOTOS FindClass(InMemoryDexClassLoader)") || dexClClass == nullptr) return;
+        auto dexClInit = env->GetMethodID(dexClClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        if (checkJniException(env, "PHOTOS constructor lookup") || dexClInit == nullptr) return;
+        auto buffer = env->NewDirectByteBuffer(dexVector.data(), static_cast<jlong>(dexVector.size()));
+        if (checkJniException(env, "PHOTOS NewDirectByteBuffer") || buffer == nullptr) return;
+        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
+        if (checkJniException(env, "PHOTOS NewObject(InMemoryDexClassLoader)") || dexCl == nullptr) return;
+        auto loadClass = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        if (checkJniException(env, "PHOTOS loadClass lookup") || loadClass == nullptr) return;
+        auto entryClassName = env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPointPhotos");
+        if (checkJniException(env, "PHOTOS NewStringUTF") || entryClassName == nullptr) return;
+        auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
+        if (checkJniException(env, "PHOTOS loadClass call") || entryClassObj == nullptr) {
+            LOGD("JNI PHOTOS: EntryPointPhotos unavailable; skipping injection");
+            return;
+        }
+
+        if (entryClassObj) {
+            auto entryClass = (jclass) entryClassObj;
+            JNINativeMethod methods[] = {{"setFieldNative", "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V", (void *) setFieldNative}};
+            const jint registerResult = env->RegisterNatives(entryClass, methods, 1);
+            if (checkJniException(env, "PHOTOS RegisterNatives") || registerResult != JNI_OK) {
+                LOGD("JNI PHOTOS: native method registration failed; skipping injection");
+                return;
+            }
+            auto receiveJson = env->GetStaticMethodID(entryClass, "receiveJson", "(Ljava/lang/String;)V");
+            if (checkJniException(env, "PHOTOS receiveJson lookup") || receiveJson == nullptr) return;
+            auto jsonStr = env->NewStringUTF(photosJson.dump().c_str());
+            if (checkJniException(env, "PHOTOS JSON allocation") || jsonStr == nullptr) return;
+            env->CallStaticVoidMethod(entryClass, receiveJson, jsonStr);
+            if (checkJniException(env, "PHOTOS receiveJson call")) return;
+            auto entryInit = env->GetStaticMethodID(entryClass, "init", "(III)V");
+            if (checkJniException(env, "PHOTOS init lookup") || entryInit == nullptr) return;
+            env->CallStaticVoidMethod(entryClass, entryInit, verboseLogs, 1, 1);
+            checkJniException(env, "PHOTOS init call");
+            if (jsonStr) env->DeleteLocalRef(jsonStr);
+            env->DeleteLocalRef(entryClassObj);
+        } else {
+            LOGD("JNI PHOTOS: EntryPointPhotos unavailable; skipping injection");
+        }
+        if (entryClassName) env->DeleteLocalRef(entryClassName);
+        if (dexCl) env->DeleteLocalRef(dexCl);
+        if (buffer) env->DeleteLocalRef(buffer);
+        env->DeleteLocalRef(dexClClass);
+        env->DeleteLocalRef(systemClassLoader);
+        env->DeleteLocalRef(clClass);
     }
 
     void injectApps() {
         ScopedLocalFrame localFrame(env, 48);
-        if (!localFrame.valid()) return;
-
-        const char *className = "es.chiteroman.playintegrityfix.EntryPointApps";
-        jclass entryClass = loadEntryClass(className, "APPS");
-        if (entryClass == nullptr || !registerEntryNatives(entryClass, "APPS")) return;
-
-        jmethodID entryInit = env->GetStaticMethodID(
-                entryClass, "init", "(ILjava/lang/String;)V");
-        if (jniFailed(env, entryInit == nullptr, "EntryPointApps.init lookup")) return;
-
-        const std::string jsonText = appJson.dump();
-        jstring jsonString = env->NewStringUTF(jsonText.c_str());
-        if (jniFailed(env, jsonString == nullptr, "NewStringUTF(app profile JSON)")) return;
-
-        env->CallStaticVoidMethod(entryClass, entryInit, verboseLogs, jsonString);
-        if (clearJniException(env, "EntryPointApps.init call")) {
-            LOGD("JNI APPS: EntryPointApps.init failed");
+        if (!localFrame.valid() || dexVector.empty()) {
+            LOGD("JNI APPS: unable to allocate local frame or module DEX is empty; skipping injection");
             return;
         }
-        LOGD("JNI APPS: EntryPointApps.init completed");
-    }
 
+        LOGD("JNI APPS: Getting system classloader");
+
+        auto clClass =
+                env->FindClass("java/lang/ClassLoader");
+        if (checkJniException(env, "APPS FindClass(ClassLoader)") || clClass == nullptr) return;
+
+        auto getSystemClassLoader =
+                env->GetStaticMethodID(
+                        clClass,
+                        "getSystemClassLoader",
+                        "()Ljava/lang/ClassLoader;"
+                );
+        if (checkJniException(env, "APPS getSystemClassLoader lookup") || getSystemClassLoader == nullptr) return;
+
+        auto systemClassLoader =
+                env->CallStaticObjectMethod(
+                        clClass,
+                        getSystemClassLoader
+                );
+        if (checkJniException(env, "APPS getSystemClassLoader call") || systemClassLoader == nullptr) return;
+
+        LOGD("JNI APPS: Creating module classloader");
+
+        auto dexClClass =
+                env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        if (checkJniException(env, "APPS FindClass(InMemoryDexClassLoader)") || dexClClass == nullptr) return;
+
+        auto dexClInit =
+                env->GetMethodID(
+                        dexClClass,
+                        "<init>",
+                        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"
+                );
+        if (checkJniException(env, "APPS constructor lookup") || dexClInit == nullptr) return;
+
+        auto buffer =
+                env->NewDirectByteBuffer(
+                        dexVector.data(),
+                        static_cast<jlong>(dexVector.size())
+                );
+        if (checkJniException(env, "APPS NewDirectByteBuffer") || buffer == nullptr) return;
+
+        auto dexCl =
+                env->NewObject(
+                        dexClClass,
+                        dexClInit,
+                        buffer,
+                        systemClassLoader
+                );
+        if (checkJniException(env, "APPS NewObject(InMemoryDexClassLoader)") || dexCl == nullptr) return;
+
+        LOGD("JNI APPS: Loading module class");
+
+        auto loadClass =
+                env->GetMethodID(
+                        clClass,
+                        "loadClass",
+                        "(Ljava/lang/String;)Ljava/lang/Class;"
+                );
+        if (checkJniException(env, "APPS loadClass lookup") || loadClass == nullptr) return;
+
+        auto entryClassName =
+                env->NewStringUTF(
+                        "es.chiteroman.playintegrityfix.EntryPointApps"
+                );
+        if (checkJniException(env, "APPS NewStringUTF") || entryClassName == nullptr) return;
+
+        auto entryClassObj =
+                env->CallObjectMethod(
+                        dexCl,
+                        loadClass,
+                        entryClassName
+                );
+
+        if (env->ExceptionCheck()) {
+            LOGD(
+                    "JNI APPS: Exception while loading EntryPointApps, clearing and aborting injection"
+            );
+
+            env->ExceptionClear();
+
+            env->DeleteLocalRef(clClass);
+            env->DeleteLocalRef(systemClassLoader);
+            env->DeleteLocalRef(dexClClass);
+            env->DeleteLocalRef(buffer);
+            env->DeleteLocalRef(dexCl);
+            env->DeleteLocalRef(entryClassName);
+
+            return;
+        }
+
+        if (entryClassObj == nullptr) {
+            LOGD(
+                    "JNI APPS: loadClass('EntryPointApps') returned null, aborting injection"
+            );
+
+            env->DeleteLocalRef(clClass);
+            env->DeleteLocalRef(systemClassLoader);
+            env->DeleteLocalRef(dexClClass);
+            env->DeleteLocalRef(buffer);
+            env->DeleteLocalRef(dexCl);
+            env->DeleteLocalRef(entryClassName);
+
+            return;
+        }
+
+        auto entryClass =
+                (jclass) entryClassObj;
+
+        JNINativeMethod methods[] = {
+            {
+                "setFieldNative",
+                "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V",
+                (void *) setFieldNative
+            }
+        };
+
+        const jint registerResult = env->RegisterNatives(
+                entryClass,
+                methods,
+                1
+        );
+        if (checkJniException(env, "APPS RegisterNatives") || registerResult != JNI_OK) {
+            LOGD("JNI APPS: native method registration failed; skipping injection");
+            return;
+        }
+
+        LOGD("JNI APPS: Calling EntryPointApps.init");
+
+        auto entryInit =
+                env->GetStaticMethodID(
+                        entryClass,
+                        "init",
+                        "(ILjava/lang/String;)V"
+                );
+        if (checkJniException(env, "APPS EntryPoint.init lookup") || entryInit == nullptr) return;
+
+        auto javaStr =
+                env->NewStringUTF(
+                        appJson.dump().c_str()
+                );
+        if (checkJniException(env, "APPS JSON allocation") || javaStr == nullptr) return;
+
+        env->CallStaticVoidMethod(
+                entryClass,
+                entryInit,
+                verboseLogs,
+                javaStr
+        );
+        checkJniException(env, "APPS EntryPoint.init call");
+
+        env->DeleteLocalRef(javaStr);
+
+        env->DeleteLocalRef(clClass);
+        env->DeleteLocalRef(systemClassLoader);
+        env->DeleteLocalRef(dexClClass);
+        env->DeleteLocalRef(buffer);
+        env->DeleteLocalRef(dexCl);
+        env->DeleteLocalRef(entryClassName);
+        env->DeleteLocalRef(entryClassObj);
+    }
 };
 
 static void companion(int fd) {
