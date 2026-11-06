@@ -3,10 +3,10 @@ name: Android CI
 on:
   workflow_dispatch:
   push:
-    branches: optimisation
+    branches: main
     paths-ignore: '**.md'
   pull_request:
-    branches: optimisation
+    branches: main
     paths-ignore: '**.md'
 
 jobs:
