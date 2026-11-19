@@ -43,7 +43,7 @@ public final class EntryPointVending {
         }
 
         if (spoofVendingSdk > 0) {
-            int requestSdk = spoofVendingSdk == 1 ? 32 : spoofVendingSdk;
+            int requestSdk = spoofVendingSdk == 1 ? 37 : spoofVendingSdk;
             int targetSdk = requestSdk;
             Field field = null;
             try {
