@@ -81,6 +81,7 @@ public final class EntryPointVending {
                 }
             }
         }
+	}
 
     private static void spoofVersionField(String fieldName, String value, int verboseLogs) {
         if (value == null || value.isEmpty()) return;
