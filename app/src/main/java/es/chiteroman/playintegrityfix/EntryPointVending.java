@@ -44,7 +44,7 @@ public final class EntryPointVending {
 
         if (spoofVendingSdk > 0) {
             int requestSdk = spoofVendingSdk == 1 ? 32 : spoofVendingSdk;
-            int targetSdk = Math.min(Build.VERSION.SDK_INT, requestSdk);
+            int targetSdk = requestSdk;
             Field field = null;
             try {
                 field = Build.VERSION.class.getDeclaredField("SDK_INT");
