@@ -538,25 +538,29 @@ h1 .material-icons{
 
 .sdk-selector{
   display:none;
-  padding:12px 14px 14px;
-  margin:-6px 0 10px;
+  padding:18px 20px 20px;
+  margin:-6px 0 12px;
   background:rgba(77,163,255,0.055);
   border:1px solid rgba(77,163,255,0.16);
   border-radius:14px;
   position:relative;z-index:2;
 }
 .sdk-selector.show{display:block}
-.sdk-options{display:flex;flex-wrap:wrap;gap:7px}
+.sdk-options{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;align-items:center;padding:4px 8px}
 .sdk-option{
   border:1px solid rgba(255,255,255,0.08);
   background:rgba(255,255,255,0.045);
   color:var(--text2);
   border-radius:999px;
-  padding:8px 11px;
+  padding:10px 16px;
+  min-width:92px;
+  text-align:center;
   font-size:12px;font-weight:600;
   cursor:pointer;transition:all .2s ease;
 }
 .sdk-option:hover{background:rgba(77,163,255,0.12);border-color:rgba(77,163,255,0.28);color:#fff}
+.sdk-option.locked{cursor:not-allowed;opacity:.42;border-style:dashed;display:flex;align-items:center;justify-content:center;gap:5px}
+.sdk-option.locked:hover{background:rgba(255,255,255,0.045);border-color:rgba(255,255,255,0.08);color:var(--text2)}
 .sdk-option.selected{
   background:rgba(77,163,255,0.18);
   border-color:rgba(77,163,255,0.5);
@@ -701,6 +705,7 @@ h1 .material-icons{
        <button type="button" class="sdk-option" data-sdk="35">Android 15</button>
        <button type="button" class="sdk-option" data-sdk="36">Android 16</button>
        <button type="button" class="sdk-option" data-sdk="37">Android 17</button>
+       <button type="button" class="sdk-option locked" disabled aria-disabled="true" title="Coming soon"><span>Android 18</span><span class="material-icons" style="font-size:14px">lock</span></button>
      </div>
    </div>
  </div>
