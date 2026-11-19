@@ -44,39 +44,43 @@ public final class EntryPointVending {
 
         if (spoofVendingSdk > 0) {
             int requestSdk = spoofVendingSdk == 1 ? 37 : spoofVendingSdk;
-            int targetSdk = requestSdk;
-            Field field = null;
-            try {
-                field = Build.VERSION.class.getDeclaredField("SDK_INT");
-                field.setAccessible(true);
+
+            if (requestSdk < 29 || requestSdk > 37) {
+                LOG("Invalid spoofVendingSdk value: " + spoofVendingSdk + " (supported: 29-37, or 1 for API 37)");
+            } else {
+                int targetSdk = requestSdk;
+                Field field = null;
                 try {
-                    Field accessFlagsField = Field.class.getDeclaredField("accessFlags");
-                    accessFlagsField.setAccessible(true);
-                    accessFlagsField.setInt(field, field.getModifiers() & ~java.lang.reflect.Modifier.FINAL);
-                } catch (NoSuchFieldException | IllegalAccessException e) {
-                    LOG("Couldn't modify accessFlags for SDK_INT: " + e);
-                }
-                int oldValue = field.getInt(null);
-                if (oldValue == targetSdk) {
-                    if (verboseLogs > 2) LOG(String.format("[SDK_INT]: %d (unchanged)", oldValue));
+                    field = Build.VERSION.class.getDeclaredField("SDK_INT");
+                    field.setAccessible(true);
+                    try {
+                        Field accessFlagsField = Field.class.getDeclaredField("accessFlags");
+                        accessFlagsField.setAccessible(true);
+                        accessFlagsField.setInt(field, field.getModifiers() & ~java.lang.reflect.Modifier.FINAL);
+                    } catch (NoSuchFieldException | IllegalAccessException e) {
+                        LOG("Couldn't modify accessFlags for SDK_INT: " + e);
+                    }
+                    int oldValue = field.getInt(null);
+                    if (oldValue == targetSdk) {
+                        if (verboseLogs > 2) LOG(String.format("[SDK_INT]: %d (unchanged)", oldValue));
+                        field.setAccessible(false);
+                        return;
+                    }
+                    try {
+                        setFieldNative(field.getDeclaringClass(), field, field.getType().getName(), targetSdk);
+                    } catch (Exception e) {
+                        LOG("Native setField failed for SDK_INT: " + e);
+                    }
                     field.setAccessible(false);
-                    return;
+                    LOG(String.format("[SDK_INT]: %d -> %d", oldValue, targetSdk));
+                } catch (NoSuchFieldException e) {
+                    LOG("SDK_INT field not found: " + e);
+                } catch (SecurityException | IllegalAccessException | IllegalArgumentException |
+                         NullPointerException | ExceptionInInitializerError e) {
+                    LOG("SDK_INT field not accessible: " + e);
                 }
-                try {
-                    setFieldNative(field.getDeclaringClass(), field, field.getType().getName(), targetSdk);
-                } catch (Exception e) {
-                    LOG("Native setField failed for SDK_INT: " + e);
-                }
-                field.setAccessible(false);
-                LOG(String.format("[SDK_INT]: %d -> %d", oldValue, targetSdk));
-            } catch (NoSuchFieldException e) {
-                LOG("SDK_INT field not found: " + e);
-            } catch (SecurityException | IllegalAccessException | IllegalArgumentException |
-                     NullPointerException | ExceptionInInitializerError e) {
-                LOG("SDK_INT field not accessible: " + e);
             }
         }
-    }
 
     private static void spoofVersionField(String fieldName, String value, int verboseLogs) {
         if (value == null || value.isEmpty()) return;
