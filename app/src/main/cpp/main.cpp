@@ -1151,8 +1151,32 @@ private:
     off_t size_ = 0;
 };
 
+class LoadOnceFile {
+public:
+    bool load(const char *path, std::vector<char> &out, size_t maxSize) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (!ready_) {
+            if (!readFile(path, data_, maxSize)) {
+                LOGD("Companion: cannot read %s", path);
+                return false;
+            }
+            ready_ = true;
+            LOGD("Companion: loaded %s (%d bytes)", path, static_cast<int>(data_.size()));
+        }
+
+        out = data_;
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<char> data_;
+    bool ready_ = false;
+};
+
 static CachedFile appProfileCache;
-static CachedFile photosProfileCache;
+static LoadOnceFile photosProfileCache;
 
 static void companion(int fd) {
     std::vector<char> dexVector;
