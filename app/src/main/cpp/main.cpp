@@ -43,6 +43,7 @@
 #define APP_PROFILE_FILE_PATH MODULE_DIR "app_profile.prop"
 #define PHOTOS_PROP_FILE_PATH MODULE_DIR "sailfish.prop"
 #define STOP_FILE MODULE_DIR "stop"
+#define STOP_FILE_BOX_BRAIN "/data/adb/Box-Brain/PIF/stop"
 
 #define PHOTOS_PACKAGE "com.google.android.apps.photos"
 #define VENDING_PACKAGE "com.android.vending"
@@ -223,7 +224,7 @@ static bool isPackageInAppsList(const std::string &pkgName) {
 
 static bool isPaused() {
     struct stat st {};
-    return stat(STOP_FILE, &st) == 0;
+    return stat(STOP_FILE, &st) == 0 || stat(STOP_FILE_BOX_BRAIN, &st) == 0;
 }
 
 // ---------------------------------------------------------------------------
