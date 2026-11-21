@@ -1,7 +1,8 @@
 #include <android/log.h>
+#include <cstdint>
 #include <sys/system_properties.h>
-#include <unistd.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "zygisk.hpp"
 #include "json/single_include/nlohmann/json.hpp"
@@ -13,38 +14,50 @@
 #include <dlfcn.h>
 #endif
 
-#include <map>
-#include <mutex>
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <climits>
-#include <cstdlib>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF/Native", __VA_ARGS__)
 
-#define DEX_FILE_PATH "/data/adb/modules/playintegrityfix/classes.dex"
+#define MODULE_DIR "/data/adb/modules/playintegrityfix/"
 
-#define PROP_FILE_PATH "/data/adb/modules/playintegrityfix/pif.prop"
-#define CUSTOM_PROP_FILE_PATH "/data/adb/modules/playintegrityfix/custom.pif.prop"
+#define DEX_FILE_PATH MODULE_DIR "classes.dex"
+#define PROP_FILE_PATH MODULE_DIR "pif.prop"
+#define CUSTOM_PROP_FILE_PATH MODULE_DIR "custom.pif.prop"
+#define JSON_FILE_PATH MODULE_DIR "pif.json"
+#define CUSTOM_JSON_FILE_PATH MODULE_DIR "custom.pif.json"
+#define APPS_FILE_PATH MODULE_DIR "apps.txt"
+#define APP_PROFILE_FILE_PATH MODULE_DIR "app_profile.prop"
+#define PHOTOS_PROP_FILE_PATH MODULE_DIR "sailfish.prop"
+#define STOP_FILE MODULE_DIR "stop"
 
-#define JSON_FILE_PATH "/data/adb/modules/playintegrityfix/pif.json"
-#define CUSTOM_JSON_FILE_PATH "/data/adb/modules/playintegrityfix/custom.pif.json"
-
-#define APPS_FILE_PATH "/data/adb/modules/playintegrityfix/apps.txt"
-#define APP_PROFILE_FILE_PATH "/data/adb/modules/playintegrityfix/app_profile.prop"
 #define PHOTOS_PACKAGE "com.google.android.apps.photos"
-#define PHOTOS_PROP_FILE_PATH "/data/adb/modules/playintegrityfix/sailfish.prop"
-
-#define STOP_FILE "/data/adb/modules/playintegrityfix/stop"
-
 #define VENDING_PACKAGE "com.android.vending"
 #define DROIDGUARD_PACKAGE "com.google.android.gms.unstable"
+
+#define ENTRY_CLASS_DROIDGUARD "es.chiteroman.playintegrityfix.EntryPoint"
+#define ENTRY_CLASS_VENDING "es.chiteroman.playintegrityfix.EntryPointVending"
+#define ENTRY_CLASS_PHOTOS "es.chiteroman.playintegrityfix.EntryPointPhotos"
+#define ENTRY_CLASS_APPS "es.chiteroman.playintegrityfix.EntryPointApps"
+
+static constexpr size_t MAX_DEX_PAYLOAD = 64U * 1024U * 1024U;
+static constexpr size_t MAX_CONFIG_PAYLOAD = 16U * 1024U * 1024U;
+static constexpr size_t MAX_APP_PROFILE_PAYLOAD = 16U * 1024U * 1024U;
+
+using PropMap = std::map<std::string, std::string, std::less<>>;
 
 static int verboseLogs = 0;
 static int spoofBuild = 1;
@@ -57,15 +70,18 @@ static int spoofPatch = 0;
 static int spoofPixel = 0;
 static int spoofApps = 0;
 static int spoofPhotos = 0;
-static std::map<std::string, std::string> photosJsonProps;
-static nlohmann::json photosJson = nlohmann::json::object();
 
-static std::map<std::string, std::string> jsonProps;
-static std::map<std::string, std::string> appJsonProps;
+static PropMap jsonProps;
+static PropMap photosJsonProps;
+static PropMap appJsonProps;
+static nlohmann::json photosJson = nlohmann::json::object();
 static nlohmann::json appJson = nlohmann::json::object();
 static std::string appProfileData;
 
-// File-descriptor I/O may complete partially or be interrupted by a signal.
+// ---------------------------------------------------------------------------
+// Generic helpers
+// ---------------------------------------------------------------------------
+
 static bool readFully(int fd, void *buffer, size_t size) {
     auto *bytes = static_cast<unsigned char *>(buffer);
     size_t offset = 0;
@@ -90,101 +106,140 @@ static bool writeFully(int fd, const void *buffer, size_t size) {
     return true;
 }
 
-static int parseIntOrKeep(const std::string &value, int current, const char *key) {
-    if (value.empty()) {
-        LOGD("Invalid integer for %s; keeping previous value %d", key, current);
-        return current;
-    }
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd) : fd_(fd) {}
+    ~ScopedFd() { if (fd_ >= 0) close(fd_); }
+    ScopedFd(const ScopedFd &) = delete;
+    ScopedFd &operator=(const ScopedFd &) = delete;
+    int get() const { return fd_; }
 
+private:
+    int fd_;
+};
+
+static std::string_view trim(std::string_view text) {
+    constexpr std::string_view whitespace = " \t\r\n";
+    const size_t first = text.find_first_not_of(whitespace);
+    if (first == std::string_view::npos) return {};
+    const size_t last = text.find_last_not_of(whitespace);
+    return text.substr(first, last - first + 1);
+}
+
+static int parseIntOrKeep(const std::string &value, int current, const char *key) {
     errno = 0;
     char *end = nullptr;
     const long parsed = std::strtol(value.c_str(), &end, 10);
 
-    if (errno == ERANGE || end == value.c_str() || end == nullptr ||
-        *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+    if (value.empty() || errno == ERANGE || end == value.c_str() || *end != '\0' ||
+        parsed < INT_MIN || parsed > INT_MAX) {
         LOGD("Invalid integer for %s; keeping previous value %d", key, current);
         return current;
     }
-
     return static_cast<int>(parsed);
 }
 
-static bool readFileIntoVector(FILE *file, std::vector<char> &out, size_t maxSize) {
-    if (file == nullptr || fseek(file, 0, SEEK_END) != 0) return false;
-    const long length = ftell(file);
-    if (length < 0 || static_cast<unsigned long long>(length) > maxSize ||
-        fseek(file, 0, SEEK_SET) != 0) return false;
+static bool readFile(const char *path, std::vector<char> &out, size_t maxSize) {
+    out.clear();
+    FILE *file = fopen(path, "rb");
+    if (file == nullptr) return false;
 
-    out.resize(static_cast<size_t>(length));
-    if (!out.empty() && fread(out.data(), 1, out.size(), file) != out.size()) {
-        out.clear();
-        return false;
+    bool ok = false;
+    if (fseek(file, 0, SEEK_END) == 0) {
+        const long length = ftell(file);
+        if (length >= 0 && static_cast<unsigned long long>(length) <= maxSize &&
+            fseek(file, 0, SEEK_SET) == 0) {
+            out.resize(static_cast<size_t>(length));
+            ok = out.empty() || fread(out.data(), 1, out.size(), file) == out.size();
+        }
     }
-    return true;
+    fclose(file);
+    if (!ok) out.clear();
+    return ok;
 }
 
-// These profiles are immutable for the lifetime of the companion process. Cache
-// only successful reads so a temporarily missing file can be retried later.
-static std::mutex profileCacheMutex;
-static std::vector<char> appProfileCache;
-static std::vector<char> photosProfileCache;
-static bool appProfileCacheReady = false;
-static bool photosProfileCacheReady = false;
+using PropLines = std::vector<std::pair<std::string, std::string>>;
 
-static bool loadCachedProfile(const char *path, std::vector<char> &cache,
-                              bool &cacheReady, std::vector<char> &out,
-                              size_t maxSize) {
-    std::lock_guard<std::mutex> lock(profileCacheMutex);
-    if (!cacheReady) {
-        LOGD("PROFILE CACHE MISS: %s; reading from disk", path);
-        errno = 0;
-        FILE *file = fopen(path, "rb");
-        if (file == nullptr) {
-            const int error = errno;
-            LOGD("PROFILE DISK OPEN FAILED: %s; errno=%d (%s)", path,
-                 error, strerror(error));
-            return false;
+// Parses "name=value" lines. '#' starts a comment, blank and malformed lines are skipped.
+// The final line is honored even without a trailing newline.
+static PropLines parsePropLines(std::string_view text, bool skipEmptyValues) {
+    PropLines result;
+    size_t begin = 0;
+    while (begin <= text.size()) {
+        size_t end = text.find('\n', begin);
+        if (end == std::string_view::npos) end = text.size();
+        std::string_view line = trim(text.substr(begin, end - begin));
+        begin = end + 1;
+
+        if (line.empty() || line.front() == '#') continue;
+
+        const size_t delimiter = line.find('=');
+        if (delimiter == std::string_view::npos) {
+            LOGD("Invalid prop entry, skipping");
+            continue;
         }
 
-        std::vector<char> loaded;
-        const bool ok = readFileIntoVector(file, loaded, maxSize);
-        const int readError = errno;
-        fclose(file);
-        if (!ok) {
-            LOGD("PROFILE DISK READ FAILED: %s; errno=%d (%s)", path,
-                 readError, strerror(readError));
-            return false;
-        }
+        const std::string_view name = trim(line.substr(0, delimiter));
+        std::string_view value = line.substr(delimiter + 1);
+        const size_t comment = value.find('#');
+        if (comment != std::string_view::npos) value = value.substr(0, comment);
+        value = trim(value);
 
-        cache.swap(loaded);
-        cacheReady = true;
-        LOGD("PROFILE DISK READ SUCCESS: %s; bytes=%d", path,
-             static_cast<int>(cache.size()));
-        LOGD("PROFILE CACHE POPULATED: %s; bytes=%d", path,
-             static_cast<int>(cache.size()));
-    } else {
-        LOGD("PROFILE CACHE HIT: %s; bytes=%d; no disk read", path,
-             static_cast<int>(cache.size()));
+        if (name.empty() || (skipEmptyValues && value.empty())) continue;
+        result.emplace_back(std::string(name), std::string(value));
     }
-
-    // Keep each request's payload independent while avoiding repeated file I/O.
-    out = cache;
-    return true;
+    return result;
 }
 
-static constexpr size_t MAX_DEX_PAYLOAD = 64U * 1024U * 1024U;
-static constexpr size_t MAX_CONFIG_PAYLOAD = 16U * 1024U * 1024U;
-static constexpr size_t MAX_APP_PROFILE_PAYLOAD = 16U * 1024U * 1024U;
+// Accepts JSON (comments allowed) or prop syntax. Returns an empty object on failure.
+static nlohmann::json parseConfig(const std::string &text, bool skipEmptyValues) {
+    if (nlohmann::json::accept(text, true)) {
+        auto parsed = nlohmann::json::parse(text, nullptr, false, true);
+        if (parsed.is_object()) return parsed;
+        return nlohmann::json::object();
+    }
+
+    LOGD("Converting config from prop format to JSON format");
+    nlohmann::json result = nlohmann::json::object();
+    for (auto &[name, value] : parsePropLines(text, skipEmptyValues))
+        result[name] = std::move(value);
+    return result;
+}
+
+static bool isPackageInAppsList(const std::string &pkgName) {
+    FILE *appsFile = fopen(APPS_FILE_PATH, "r");
+    if (appsFile == nullptr) return false;
+
+    bool found = false;
+    char line[512];
+    while (!found && fgets(line, sizeof(line), appsFile)) {
+        const std::string_view entry = trim(line);
+        found = !entry.empty() && entry == pkgName;
+    }
+
+    fclose(appsFile);
+    return found;
+}
+
+static bool isPaused() {
+    struct stat st {};
+    return stat(STOP_FILE, &st) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Property spoofing
+// ---------------------------------------------------------------------------
 
 #if defined(__aarch64__) || defined(__arm__)
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 
-// Android invokes the property callback synchronously. Keep the original callback and
-// cookie in a stack context instead of a process-global map keyed by caller-owned cookies.
 struct CallbackContext {
     T_Callback callback;
     void *originalCookie;
 };
+
+// Patterns of the form "*suffix", resolved once before the hook is installed.
+static std::vector<std::pair<std::string, std::string>> wildcardProps;
 
 static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
     auto *context = static_cast<CallbackContext *>(cookie);
@@ -193,23 +248,21 @@ static void modify_callback(void *cookie, const char *name, const char *value, u
     const char *replacement = value;
     if (name != nullptr && value != nullptr) {
         const std::string_view prop(name);
-        const auto exact = jsonProps.find(std::string(prop));
+        const auto exact = jsonProps.find(prop);
         if (exact != jsonProps.end()) {
             replacement = exact->second.c_str();
         } else {
-            for (const auto &entry : jsonProps) {
-                const std::string_view pattern(entry.first);
-                if (!pattern.empty() && pattern.front() == '*' &&
-                    prop.ends_with(pattern.substr(1))) {
-                    replacement = entry.second.c_str();
+            for (const auto &[suffix, spoofed] : wildcardProps) {
+                if (prop.ends_with(suffix)) {
+                    replacement = spoofed.c_str();
                     break;
                 }
             }
         }
 
-        if (verboseLogs > 0 && replacement != nullptr && strcmp(value, replacement) != 0) {
+        if (verboseLogs > 0 && strcmp(value, replacement) != 0) {
             LOGD("[%s]: %s -> %s", name, value, replacement);
-        } else if (verboseLogs > 99 && replacement != nullptr) {
+        } else if (verboseLogs > 99) {
             LOGD("[%s]: %s (unchanged)", name, value);
         }
     }
@@ -235,18 +288,23 @@ extern "C" int sh_linker_init(void) {
 }
 
 static void doHook() {
+    wildcardProps.clear();
+    for (const auto &[pattern, spoofed] : jsonProps) {
+        if (pattern.size() > 1 && pattern.front() == '*')
+            wildcardProps.emplace_back(pattern.substr(1), spoofed);
+    }
+
     shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
-    void *sym_addr = dlsym(RTLD_DEFAULT, "__system_property_read_callback");
-    if (sym_addr == nullptr) {
+    void *symbol = dlsym(RTLD_DEFAULT, "__system_property_read_callback");
+    if (symbol == nullptr) {
         LOGD("Couldn't find '__system_property_read_callback' via dlsym");
         return;
     }
 
     void *handle = shadowhook_hook_sym_addr(
-            sym_addr,
+            symbol,
             reinterpret_cast<void *>(my_system_property_read_callback),
             reinterpret_cast<void **>(&o_system_property_read_callback));
-
     if (handle == nullptr) {
         LOGD("Couldn't hook '__system_property_read_callback'. Error: %d", shadowhook_get_errno());
         return;
@@ -260,101 +318,95 @@ static void doHook() {
 }
 #endif
 
-static bool installPropertyVirtualizer(const nlohmann::json &source) {
+// Fills BRAND/PRODUCT/DEVICE/... from "brand/product/device:release/id/incremental:type/tags".
+static void expandFingerprint(std::map<std::string, std::string> &propMap,
+                              const std::string &fingerprint) {
+    if (fingerprint.empty()) return;
+
+    static constexpr const char *fieldNames[] = {
+        "BRAND", "PRODUCT", "DEVICE", "RELEASE", "ID", "INCREMENTAL", "TYPE", "TAGS"
+    };
+
+    size_t index = 0;
+    size_t begin = 0;
+    while (index < std::size(fieldNames)) {
+        const size_t end = fingerprint.find_first_of("/:", begin);
+        const std::string part = fingerprint.substr(
+                begin, end == std::string::npos ? std::string::npos : end - begin);
+        propMap.emplace(fieldNames[index++], part);
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+}
+
+static std::string jsonString(const nlohmann::json &source, const char *key) {
+    const auto it = source.find(key);
+    return it != source.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
+// mergeSource: also expose every string entry of `source` as a spoofed property key.
+static bool installVirtualizer(const PropMap &props, const nlohmann::json &source, bool mergeSource) {
     pif::Config config;
     config.debug = verboseLogs > 1;
 
-    for (const auto &[key, value] : jsonProps) {
-        config.propMap[key] = value;
-    }
+    for (const auto &[key, value] : props) config.propMap[key] = value;
 
-    for (const auto &item : source.items()) {
-        if (item.value().is_string()) {
-            config.propMap[item.key()] = item.value().get<std::string>();
+    if (mergeSource) {
+        for (const auto &item : source.items()) {
+            if (item.value().is_string())
+                config.propMap[item.key()] = item.value().get<std::string>();
         }
     }
 
-    // Fingerprint expansion 
-    const auto fingerprintIt = config.propMap.find("FINGERPRINT");
-    if (fingerprintIt != config.propMap.end() && !fingerprintIt->second.empty()) {
-        std::vector<std::string> parts;
-        std::string current;
-        for (char ch : fingerprintIt->second) {
-            if (ch == '/' || ch == ':') {
-                parts.push_back(current);
-                current.clear();
-            } else {
-                current.push_back(ch);
-            }
-        }
-        parts.push_back(current);
+    expandFingerprint(config.propMap, jsonString(source, "FINGERPRINT"));
 
-        static const char *fieldNames[] = {
-            "BRAND", "PRODUCT", "DEVICE", "RELEASE",
-            "ID", "INCREMENTAL", "TYPE", "TAGS"
-        };
-        for (size_t i = 0; i < sizeof(fieldNames) / sizeof(fieldNames[0]); ++i) {
-            if (config.propMap.find(fieldNames[i]) == config.propMap.end() && i < parts.size()) {
-                config.propMap[fieldNames[i]] = parts[i];
-            }
-        }
-    }
-
-    auto getConfigValue = [](const nlohmann::json &source, const char *key) -> std::string {
-        if (source.contains(key) && source[key].is_string()) {
-            return source[key].get<std::string>();
-        }
-        return {};
-    };
-
-    config.buildId = getConfigValue(source, "ID");
-    config.securityPatch = getConfigValue(source, "SECURITY_PATCH");
-    const std::string initialSdk = getConfigValue(source, "DEVICE_INITIAL_SDK_INT");
+    config.buildId = jsonString(source, "ID");
+    config.securityPatch = jsonString(source, "SECURITY_PATCH");
+    const std::string initialSdk = jsonString(source, "DEVICE_INITIAL_SDK_INT");
     if (!initialSdk.empty()) config.deviceInitialSdkInt = initialSdk;
 
     const bool installed = pif::property_virtualizer::install(config);
-    if (!installed) {
-        LOGD("Property-area virtualization failed; attempting callback-hook fallback");
-    }
+    if (!installed) LOGD("Property-area virtualization failed");
     return installed;
 }
 
-static bool isPackageInAppsList(const std::string &pkgName) {
-    FILE *appsFile = fopen(APPS_FILE_PATH, "r");
-
-    if (!appsFile) return false;
-
-    bool found = false;
-    char line[256];
-
-    while (fgets(line, sizeof(line), appsFile)) {
-        size_t len = strlen(line);
-
-        if (len > 0 && line[len - 1] == '\n')
-            line[len - 1] = '\0';
-
-        len = strlen(line);
-
-        if (len > 0 && line[len - 1] == '\r')
-            line[len - 1] = '\0';
-
-        if (strlen(line) > 0 && pkgName == line) {
-            found = true;
-            break;
-        }
-    }
-
-    fclose(appsFile);
-    return found;
-}
-
-static bool isPaused() {
-    struct stat st {};
-    return stat(STOP_FILE, &st) == 0;
-}
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
 
 static bool loadAppProfile() {
-    appJson.clear();
+    static constexpr struct {
+        const char *property;
+        const char *field;
+    } mappings[] = {
+        {"ro.product.manufacturer", "MANUFACTURER"},
+        {"ro.product.brand", "BRAND"},
+        {"ro.product.model", "MODEL"},
+        {"ro.product.name", "PRODUCT"},
+        {"ro.product.device", "DEVICE"},
+        {"ro.product.board", "BOARD"},
+        {"ro.build.fingerprint", "FINGERPRINT"},
+        {"ro.build.version.release", "RELEASE"},
+        {"ro.build.version.sdk", "SDK_INT"},
+        {"ro.build.version.preview_sdk", "PREVIEW_SDK_INT"},
+        {"ro.build.id", "ID"},
+        {"ro.build.version.incremental", "INCREMENTAL"},
+        {"ro.build.type", "TYPE"},
+        {"ro.build.tags", "TAGS"},
+        {"ro.build.version.security_patch", "SECURITY_PATCH"},
+        {"ro.build.version.codename", "CODENAME"},
+        {"ro.build.version.all_codenames", "ALL_CODENAMES"},
+        {"ro.build.version.base_os", "BASE_OS"},
+        {"ro.build.display.id", "DISPLAY"},
+        {"ro.build.user", "USER"},
+        {"ro.build.host", "HOST"},
+        {"ro.bootloader", "BOOTLOADER"},
+        {"ro.hardware", "HARDWARE"},
+        {"ro.soc.manufacturer", "SOC_MANUFACTURER"},
+        {"ro.soc.model", "SOC_MODEL"},
+    };
+
+    appJson = nlohmann::json::object();
     appJsonProps.clear();
 
     if (appProfileData.empty()) {
@@ -362,106 +414,57 @@ static bool loadAppProfile() {
         return false;
     }
 
-    nlohmann::json profileBuild = nlohmann::json::object();
-    size_t begin = 0;
-
-    while (begin < appProfileData.size()) {
-        size_t end = appProfileData.find('\n', begin);
-        if (end == std::string::npos) end = appProfileData.size();
-
-        std::string entry = appProfileData.substr(begin, end - begin);
-        begin = end + 1;
-
-        if (!entry.empty() && entry.back() == '\r') entry.pop_back();
-
-        size_t first = entry.find_first_not_of(" \t");
-        if (first == std::string::npos || entry[first] == '#') continue;
-
-        size_t delimiter = entry.find('=', first);
-        if (delimiter == std::string::npos) continue;
-
-        size_t nameEnd = delimiter;
-        while (nameEnd > first && (entry[nameEnd - 1] == ' ' || entry[nameEnd - 1] == '\t')) nameEnd--;
-
-        size_t valueStart = delimiter + 1;
-        while (valueStart < entry.size() && (entry[valueStart] == ' ' || entry[valueStart] == '\t')) valueStart++;
-
-        std::string name = entry.substr(first, nameEnd - first);
-        std::string value = entry.substr(valueStart);
-
-        size_t comment = value.find('#');
-        if (comment != std::string::npos) value.resize(comment);
-        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
-
-        if (name.empty() || value.empty()) continue;
-
-        // Ignore empty values in app_profile.prop
-        appJsonProps[name] = value;
-
-        const char *buildField = nullptr;
-        if (name == "ro.product.manufacturer") buildField = "MANUFACTURER";
-        else if (name == "ro.product.brand") buildField = "BRAND";
-        else if (name == "ro.product.model") buildField = "MODEL";
-        else if (name == "ro.product.name") buildField = "PRODUCT";
-        else if (name == "ro.product.device") buildField = "DEVICE";
-        else if (name == "ro.product.board") buildField = "BOARD";
-        else if (name == "ro.build.fingerprint") buildField = "FINGERPRINT";
-        else if (name == "ro.build.version.release") buildField = "RELEASE";
-        else if (name == "ro.build.version.sdk") buildField = "SDK_INT";
-        else if (name == "ro.build.version.preview_sdk") buildField = "PREVIEW_SDK_INT";
-        else if (name == "ro.build.id") buildField = "ID";
-        else if (name == "ro.build.version.incremental") buildField = "INCREMENTAL";
-        else if (name == "ro.build.type") buildField = "TYPE";
-        else if (name == "ro.build.tags") buildField = "TAGS";
-        else if (name == "ro.build.version.security_patch") buildField = "SECURITY_PATCH";
-        else if (name == "ro.build.version.codename") buildField = "CODENAME";
-        else if (name == "ro.build.version.all_codenames") buildField = "ALL_CODENAMES";
-        else if (name == "ro.build.version.base_os") buildField = "BASE_OS";
-        else if (name == "ro.build.display.id") buildField = "DISPLAY";
-        else if (name == "ro.build.user") buildField = "USER";
-        else if (name == "ro.build.host") buildField = "HOST";
-        else if (name == "ro.bootloader") buildField = "BOOTLOADER";
-        else if (name == "ro.hardware") buildField = "HARDWARE";
-        else if (name == "ro.soc.manufacturer") buildField = "SOC_MANUFACTURER";
-        else if (name == "ro.soc.model") buildField = "SOC_MODEL";
-
-        if (buildField) {
-            profileBuild[buildField] = value;
-            LOGD("App profile mapping: %s -> Build.%s", name.c_str(), buildField);
-        } else {
-            const bool propertyOnly = name == "ro.build.description" || name == "ro.build.flavor"
-                    || name == "ro.product.characteristics" || name == "ro.build.characteristics"
-                    || name == "ro.build.product" || name == "ro.build.date" || name == "ro.build.date.utc"
-                    || name == "ro.board.platform";
-            if (propertyOnly) {
-                LOGD("App profile property unsupported by Build-field spoofing: %s (not a Build/Build.VERSION field; left unchanged)", name.c_str());
-            } else {
-                LOGD("App profile property has no Build mapping: %s (not changed by per-app Build spoofing)", name.c_str());
-            }
+    for (auto &[name, value] : parsePropLines(appProfileData, true)) {
+        const auto mapping = std::find_if(std::begin(mappings), std::end(mappings),
+                                          [&](const auto &m) { return name == m.property; });
+        if (mapping != std::end(mappings)) {
+            appJson[mapping->field] = value;
+            if (verboseLogs > 0)
+                LOGD("App profile mapping: %s -> Build.%s", name.c_str(), mapping->field);
+        } else if (name != "persist.sys.timezone" && verboseLogs > 0) {
+            LOGD("App profile property has no Build mapping: %s (left unchanged)", name.c_str());
         }
+        appJsonProps[std::move(name)] = std::move(value);
     }
 
-    appJson = profileBuild;
-    auto timezoneIt = appJsonProps.find("persist.sys.timezone");
-    if (timezoneIt != appJsonProps.end())
-        appJson["persist.sys.timezone"] = timezoneIt->second;
+    const auto timezone = appJsonProps.find("persist.sys.timezone");
+    if (timezone != appJsonProps.end()) appJson["persist.sys.timezone"] = timezone->second;
 
-    // Report the hardware/version identity
-    auto logProfileValue = [&](const char *name) {
-        auto it = appJsonProps.find(name);
-        if (it != appJsonProps.end())
-            LOGD("Profile %s=%s", name, it->second.c_str());
-    };
-    logProfileValue("ro.build.version.release");
-    logProfileValue("ro.build.version.sdk");
-    logProfileValue("ro.hardware");
-    logProfileValue("ro.board.platform");
-    logProfileValue("ro.soc.manufacturer");
-    logProfileValue("ro.soc.model");
-
-    LOGD("Loaded app profile: %d non-empty properties, %d mapped Build fields, %d JSON entries", static_cast<int>(appJsonProps.size()), static_cast<int>(profileBuild.size()), static_cast<int>(appJson.size()));
+    LOGD("Loaded app profile: %d properties, %d JSON entries",
+         static_cast<int>(appJsonProps.size()), static_cast<int>(appJson.size()));
     return !appJsonProps.empty();
 }
+
+static bool hasUppercase(const std::string &value) {
+    return std::any_of(value.begin(), value.end(),
+                       [](unsigned char c) { return std::isupper(c) != 0; });
+}
+
+// Splits the Photos config into system-property entries and Java Build fields.
+static void readPhotosJson() {
+    photosJsonProps.clear();
+    for (auto it = photosJson.begin(); it != photosJson.end();) {
+        const std::string &key = it.key();
+        const bool hasDot = key.find('.') != std::string::npos;
+        const bool hasStar = key.find('*') != std::string::npos;
+        const bool nonEmptyString = it.value().is_string() && !it.value().get<std::string>().empty();
+
+        if (hasStar || (hasDot && !hasUppercase(key))) {
+            if (nonEmptyString) photosJsonProps[key] = it.value().get<std::string>();
+            it = photosJson.erase(it);
+        } else if (hasDot && !nonEmptyString) {
+            it = photosJson.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    LOGD("Photos config: %d props, %d Java entries",
+         static_cast<int>(photosJsonProps.size()), static_cast<int>(photosJson.size()));
+}
+
+// ---------------------------------------------------------------------------
+// JNI helpers
+// ---------------------------------------------------------------------------
 
 static bool checkJniException(JNIEnv *env, const char *stage) {
     if (env != nullptr && env->ExceptionCheck()) {
@@ -474,7 +477,7 @@ static bool checkJniException(JNIEnv *env, const char *stage) {
 
 class ScopedLocalFrame {
 public:
-    explicit ScopedLocalFrame(JNIEnv *env, jint capacity) : env_(env) {
+    ScopedLocalFrame(JNIEnv *env, jint capacity) : env_(env) {
         active_ = env_ != nullptr && env_->PushLocalFrame(capacity) == JNI_OK;
         if (!active_) checkJniException(env_, "PushLocalFrame");
     }
@@ -493,161 +496,95 @@ private:
     bool active_ = false;
 };
 
-static void setFieldNative(
-        JNIEnv *env,
-        jclass /* clazz_EntryPoint */,
-        jclass targetClass,
-        jobject fieldObj,
-        jstring typeObj,
-        jobject valueObj) {
+class ScopedUtf {
+public:
+    ScopedUtf(JNIEnv *env, jstring str)
+            : env_(env), str_(str),
+              chars_(str != nullptr ? env->GetStringUTFChars(str, nullptr) : nullptr) {}
 
-    if (env == nullptr || !targetClass || !fieldObj || !typeObj) return;
+    ~ScopedUtf() {
+        if (chars_ != nullptr) env_->ReleaseStringUTFChars(str_, chars_);
+    }
+
+    ScopedUtf(const ScopedUtf &) = delete;
+    ScopedUtf &operator=(const ScopedUtf &) = delete;
+
+    const char *get() const { return chars_; }
+
+private:
+    JNIEnv *env_;
+    jstring str_;
+    const char *chars_;
+};
+
+static void setFieldNative(JNIEnv *env, jclass /* entryPoint */, jclass targetClass,
+                           jobject fieldObj, jstring typeObj, jobject valueObj) {
+    if (env == nullptr || targetClass == nullptr || fieldObj == nullptr || typeObj == nullptr)
+        return;
 
     jfieldID fieldID = env->FromReflectedField(fieldObj);
     if (checkJniException(env, "FromReflectedField") || fieldID == nullptr) return;
 
-    const char *typeName = env->GetStringUTFChars(typeObj, nullptr);
-    if (checkJniException(env, "GetStringUTFChars") || typeName == nullptr) return;
+    ScopedUtf type(env, typeObj);
+    if (checkJniException(env, "GetStringUTFChars") || type.get() == nullptr) return;
+    const std::string_view typeName(type.get());
 
-    jclass wrapperClass = nullptr;
-    do {
-        if (strcmp(typeName, "java.lang.String") == 0 ||
-            strcmp(typeName, "[Ljava.lang.String;") == 0) {
-            env->SetStaticObjectField(targetClass, fieldID, valueObj);
-            break;
-        }
+    if (typeName == "java.lang.String" || typeName == "[Ljava.lang.String;") {
+        env->SetStaticObjectField(targetClass, fieldID, valueObj);
+        checkJniException(env, "SetStaticObjectField");
+        return;
+    }
+    if (valueObj == nullptr) return;
 
-        if (valueObj == nullptr) break;
+    const char *wrapperName = nullptr;
+    const char *methodName = nullptr;
+    const char *signature = nullptr;
+    if (typeName == "int") {
+        wrapperName = "java/lang/Integer", methodName = "intValue", signature = "()I";
+    } else if (typeName == "long") {
+        wrapperName = "java/lang/Long", methodName = "longValue", signature = "()J";
+    } else if (typeName == "boolean") {
+        wrapperName = "java/lang/Boolean", methodName = "booleanValue", signature = "()Z";
+    } else {
+        return;
+    }
 
-        const char *wrapperName = nullptr;
-        const char *methodName = nullptr;
-        const char *signature = nullptr;
-        if (strcmp(typeName, "int") == 0) {
-            wrapperName = "java/lang/Integer";
-            methodName = "intValue";
-            signature = "()I";
-        } else if (strcmp(typeName, "long") == 0) {
-            wrapperName = "java/lang/Long";
-            methodName = "longValue";
-            signature = "()J";
-        } else if (strcmp(typeName, "boolean") == 0) {
-            wrapperName = "java/lang/Boolean";
-            methodName = "booleanValue";
-            signature = "()Z";
-        } else {
-            break;
-        }
+    jclass wrapperClass = env->FindClass(wrapperName);
+    if (checkJniException(env, "FindClass(wrapper)") || wrapperClass == nullptr) return;
 
-        wrapperClass = env->FindClass(wrapperName);
-        if (checkJniException(env, "FindClass(wrapper)") || wrapperClass == nullptr) break;
+    jmethodID unbox = env->GetMethodID(wrapperClass, methodName, signature);
+    env->DeleteLocalRef(wrapperClass);
+    if (checkJniException(env, "GetMethodID(unbox)") || unbox == nullptr) return;
 
-        jmethodID unboxMethod = env->GetMethodID(wrapperClass, methodName, signature);
-        if (checkJniException(env, "GetMethodID(unbox)") || unboxMethod == nullptr) break;
-
-        if (strcmp(typeName, "int") == 0) {
-            jint value = env->CallIntMethod(valueObj, unboxMethod);
-            if (!checkJniException(env, "Integer.intValue"))
-                env->SetStaticIntField(targetClass, fieldID, value);
-        } else if (strcmp(typeName, "long") == 0) {
-            jlong value = env->CallLongMethod(valueObj, unboxMethod);
-            if (!checkJniException(env, "Long.longValue"))
-                env->SetStaticLongField(targetClass, fieldID, value);
-        } else {
-            jboolean value = env->CallBooleanMethod(valueObj, unboxMethod);
-            if (!checkJniException(env, "Boolean.booleanValue"))
-                env->SetStaticBooleanField(targetClass, fieldID, value);
-        }
-    } while (false);
-
+    if (typeName == "int") {
+        const jint value = env->CallIntMethod(valueObj, unbox);
+        if (!checkJniException(env, "Integer.intValue"))
+            env->SetStaticIntField(targetClass, fieldID, value);
+    } else if (typeName == "long") {
+        const jlong value = env->CallLongMethod(valueObj, unbox);
+        if (!checkJniException(env, "Long.longValue"))
+            env->SetStaticLongField(targetClass, fieldID, value);
+    } else {
+        const jboolean value = env->CallBooleanMethod(valueObj, unbox);
+        if (!checkJniException(env, "Boolean.booleanValue"))
+            env->SetStaticBooleanField(targetClass, fieldID, value);
+    }
     checkJniException(env, "SetStaticField");
-    if (wrapperClass != nullptr) env->DeleteLocalRef(wrapperClass);
-    env->ReleaseStringUTFChars(typeObj, typeName);
 }
 
-static std::string propToJson(std::string configString) {
-    if (nlohmann::json::accept(configString, true)) return configString;
+// ---------------------------------------------------------------------------
+// Module
+// ---------------------------------------------------------------------------
 
-    configString.erase(std::remove(configString.begin(), configString.end(), '\r'), configString.end());
-    std::string jsonString = "{";
-    size_t beginPos = 0;
-    while (beginPos < configString.size()) {
-        size_t endPos = configString.find('\n', beginPos);
-        std::string line = endPos == std::string::npos
-                ? configString.substr(beginPos)
-                : configString.substr(beginPos, endPos - beginPos);
-        beginPos = endPos == std::string::npos ? configString.size() : endPos + 1;
-        if (line.empty() || line[0] == '#') continue;
+struct PayloadHeader {
+    int64_t dexSize;
+    int64_t configSize;
+    int64_t appProfileSize;
+    int64_t photosConfigSize;
+};
 
-        const size_t delimiter = line.find('=');
-        if (delimiter == std::string::npos) continue;
-        std::string name = line.substr(0, delimiter);
-        std::string value = line.substr(delimiter + 1);
-        const size_t comment = value.find('#');
-        if (comment != std::string::npos) value.resize(comment);
-        const size_t last = value.find_last_not_of(" \t");
-        value = last == std::string::npos ? "" : value.substr(0, last + 1);
-        if (value.empty()) continue;
-        jsonString += "\n\"" + name + "\": \"" + value + "\",";
-    }
-    if (!jsonString.empty() && jsonString.back() == ',') jsonString.pop_back();
-    jsonString += "\n}\n";
-    return jsonString;
-}
-
-static bool hasUppercase(const std::string &value) {
-    return std::any_of(value.begin(), value.end(), [](unsigned char c) { return std::isupper(c); });
-}
-
-static void readPhotosJson() {
-    std::vector<std::string> eraseKeys;
-    photosJsonProps.clear();
-    for (auto &item : photosJson.items()) {
-        const std::string &key = item.key();
-        const bool hasDot = key.find('.') != std::string::npos;
-        const bool hasStar = key.find('*') != std::string::npos;
-        if (hasStar || (hasDot && !hasUppercase(key))) {
-            if (item.value().is_string() && !item.value().get<std::string>().empty())
-                photosJsonProps[key] = item.value().get<std::string>();
-            eraseKeys.push_back(key);
-        } else if (hasDot && (!item.value().is_string() || item.value().get<std::string>().empty())) {
-            eraseKeys.push_back(key);
-        }
-    }
-    for (const auto &key : eraseKeys) photosJson.erase(key);
-    LOGD("Photos config: %d props, %d Java entries",
-         static_cast<int>(photosJsonProps.size()), static_cast<int>(photosJson.size()));
-}
-
-static bool installPhotosVirtualizer() {
-    if (photosJsonProps.empty()) return true;
-    pif::Config config;
-    config.debug = verboseLogs > 1;
-    for (const auto &[key, value] : photosJsonProps) config.propMap[key] = value;
-
-    const auto fingerprintIt = photosJson.find("FINGERPRINT");
-    if (fingerprintIt != photosJson.end() && fingerprintIt->is_string() && !fingerprintIt->get<std::string>().empty()) {
-        std::vector<std::string> parts;
-        std::string current;
-        for (char ch : fingerprintIt->get<std::string>()) {
-            if (ch == '/' || ch == ':') { parts.push_back(current); current.clear(); }
-            else current.push_back(ch);
-        }
-        parts.push_back(current);
-        static const char *fieldNames[] = {"BRAND", "PRODUCT", "DEVICE", "RELEASE", "ID", "INCREMENTAL", "TYPE", "TAGS"};
-        for (size_t i = 0; i < sizeof(fieldNames) / sizeof(fieldNames[0]); ++i)
-            if (config.propMap.find(fieldNames[i]) == config.propMap.end() && i < parts.size())
-                config.propMap[fieldNames[i]] = parts[i];
-    }
-
-    auto getValue = [](const char *key) -> std::string {
-        if (photosJson.contains(key) && photosJson[key].is_string()) return photosJson[key].get<std::string>();
-        return {};
-    };
-    config.buildId = getValue("ID");
-    config.securityPatch = getValue("SECURITY_PATCH");
-    const std::string initialSdk = getValue("DEVICE_INITIAL_SDK_INT");
-    if (!initialSdk.empty()) config.deviceInitialSdkInt = initialSdk;
-    return pif::property_virtualizer::install(config);
+static bool inRange(int64_t value, int64_t min, size_t max) {
+    return value >= min && static_cast<uint64_t>(value) <= max;
 }
 
 class PlayIntegrityFix : public zygisk::ModuleBase {
@@ -658,259 +595,45 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        const char *rawProcess = args->nice_name != nullptr
-                ? env->GetStringUTFChars(args->nice_name, nullptr) : nullptr;
-        const char *rawDir = args->app_data_dir != nullptr
-                ? env->GetStringUTFChars(args->app_data_dir, nullptr) : nullptr;
-
-        if (rawProcess == nullptr) {
-            if (rawDir != nullptr)
-                env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        processName = rawProcess;
-        if (rawDir != nullptr) {
-            const std::string_view dir(rawDir);
-            const size_t slash = dir.find_last_of('/');
-            pkgName = slash == std::string_view::npos
-                    ? std::string(dir) : std::string(dir.substr(slash + 1));
-        } else {
-            // Fall back to the process name, excluding Android's :process suffix.
-            const size_t colon = processName.find(':');
-            pkgName = processName.substr(0, colon);
-        }
-
-        env->ReleaseStringUTFChars(args->nice_name, rawProcess);
-        if (rawDir != nullptr)
-            env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
+        resolveNames(args);
 
         const bool isPhotos = pkgName == PHOTOS_PACKAGE;
-        const bool isDroidGuardOrVending =
-                processName == DROIDGUARD_PACKAGE || pkgName == VENDING_PACKAGE;
+        isDroidGuardOrVending = processName == DROIDGUARD_PACKAGE || pkgName == VENDING_PACKAGE;
 
         // Match apps by package, not process name, so secondary app processes use
         // the same profile without admitting unrelated GMS processes.
-        isTargetApp = isPackageInAppsList(pkgName);
+        isTargetApp = !pkgName.empty() && isPackageInAppsList(pkgName);
 
-        // Do not load the companion payload (including the DEX) into every GMS
-        // process. Only DroidGuard, Play Store, explicitly targeted apps, and
-        // Google Photos need the module.
         if (!isDroidGuardOrVending && !isTargetApp && !isPhotos) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            unload();
             return;
         }
 
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
 
         if (isDroidGuardOrVending && isPaused()) {
-            LOGD("ZYGISK: Injection is paused by user, skipping Integrity-Box spoofing for %s", pkgName.c_str());
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            LOGD("ZYGISK: Injection is paused by user, skipping spoofing for %s", pkgName.c_str());
+            unload();
             return;
         }
 
-        std::vector<char> configVector;
-        long dexSize = 0;
-        long configSize = 0;
-        long appProfileSize = 0;
-        long photosConfigSize = 0;
-
-        int fd = api->connectCompanion();
-
-        if (fd < 0) {
-            LOGD("Couldn't connect to companion");
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
+        if (!fetchPayload()) {
+            releasePayload();
+            unload();
         }
-
-        if (!readFully(fd, &dexSize, sizeof(long)) ||
-            !readFully(fd, &configSize, sizeof(long)) ||
-            !readFully(fd, &appProfileSize, sizeof(long)) ||
-            !readFully(fd, &photosConfigSize, sizeof(long))) {
-            close(fd);
-            LOGD("Couldn't read companion sizes");
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        if (dexSize < 1 || static_cast<unsigned long long>(dexSize) > MAX_DEX_PAYLOAD ||
-            configSize < 1 || static_cast<unsigned long long>(configSize) > MAX_CONFIG_PAYLOAD ||
-            appProfileSize < 0 || static_cast<unsigned long long>(appProfileSize) > MAX_APP_PROFILE_PAYLOAD ||
-            photosConfigSize < 0 || static_cast<unsigned long long>(photosConfigSize) > MAX_CONFIG_PAYLOAD) {
-            close(fd);
-            LOGD("Companion returned invalid payload sizes (dex=%ld, config=%ld, profile=%ld)",
-                 dexSize, configSize, appProfileSize);
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-
-        LOGD("Read from file descriptor for 'dex' -> %ld bytes", dexSize);
-        LOGD("Read from file descriptor for 'config' -> %ld bytes", configSize);
-        LOGD("Read from file descriptor for 'app profile' -> %ld bytes", appProfileSize);
-
-        dexVector.resize(dexSize);
-
-        if (!readFully(fd, dexVector.data(), static_cast<size_t>(dexSize))) {
-            close(fd);
-            LOGD("Couldn't read dex payload");
-            dexVector.clear();
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        configVector.resize(configSize);
-
-        if (!readFully(fd, configVector.data(), static_cast<size_t>(configSize))) {
-            close(fd);
-            LOGD("Couldn't read config payload");
-            dexVector.clear();
-            configVector.clear();
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        if (appProfileSize > 0) {
-            appProfileData.resize(appProfileSize);
-            if (!readFully(fd, appProfileData.data(), static_cast<size_t>(appProfileSize))) {
-                close(fd);
-                LOGD("Couldn't read app profile payload");
-                dexVector.clear();
-                configVector.clear();
-                appProfileData.clear();
-                api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-                return;
-            }
-        } else {
-            appProfileData.clear();
-        }
-
-        if (photosConfigSize > 0) {
-            photosConfigVector.resize(static_cast<size_t>(photosConfigSize));
-            if (!readFully(fd, photosConfigVector.data(), static_cast<size_t>(photosConfigSize))) {
-                close(fd);
-                LOGD("Couldn't read photos config payload");
-                photosConfigVector.clear();
-                api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-                return;
-            }
-        } else {
-            photosConfigVector.clear();
-        }
-
-        close(fd);
-
-        std::string configString(configVector.cbegin(), configVector.cend());
-
-        if (!nlohmann::json::accept(configString, true)) {
-            LOGD("Converting config from prop format to JSON format");
-
-            configString.erase(
-                    std::remove(configString.begin(), configString.end(), '\r'),
-                    configString.end()
-            );
-
-            std::string jsonString = "{";
-
-            char propDelimiter = '=';
-            char commentDelimiter = '#';
-
-            size_t beginPos = 0;
-            size_t endPos = 0;
-
-            while ((endPos = configString.find('\n', beginPos)) != std::string::npos) {
-                std::string line = configString.substr(beginPos, endPos - beginPos);
-                beginPos = endPos + 1;
-
-                if (line.empty() || line[0] == '#')
-                    continue;
-
-                std::string name;
-                std::string value;
-
-                size_t propDelimiterPos = line.find(propDelimiter);
-
-                if (propDelimiterPos != std::string::npos) {
-                    name = line.substr(0, propDelimiterPos);
-                    value = line.substr(propDelimiterPos + 1);
-                } else {
-                    LOGD("Invalid prop entry, skipping");
-                    continue;
-                }
-
-                size_t commentDelimiterPos = value.find(commentDelimiter);
-
-                if (commentDelimiterPos != std::string::npos) {
-                    value = value.substr(0, commentDelimiterPos);
-
-                    size_t lastPos = value.find_last_not_of(" ");
-
-                    if (lastPos != std::string::npos)
-                        value.resize(lastPos + 1);
-                }
-
-                jsonString += "\n\"" + name + "\": \"" + value + "\",";
-            }
-
-            if (!jsonString.empty() && jsonString.back() == ',')
-                jsonString.pop_back();
-
-            jsonString += "\n}\n";
-
-            configString = jsonString;
-            jsonString.clear();
-        }
-
-        json = nlohmann::json::parse(configString, nullptr, false, true);
-
-        configVector.clear();
-        configString.clear();
     }
 
-    static bool hasPairIpCoreLoaded() {
-        FILE *maps = fopen("/proc/self/maps", "r");
-        if (!maps) return false;
-
-        char line[1024];
-        bool found = false;
-        while (fgets(line, sizeof(line), maps)) {
-            if (strstr(line, "libpairipcore.so") != nullptr) {
-                found = true;
-                break;
-            }
-        }
-        fclose(maps);
-        return found;
-    }
-
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (dexVector.empty() || json.empty())
-            return;
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+        if (dexVector.empty() || json.empty()) return;
 
         readJson();
-
-        // The Photos profile is only used by Google Photos. Avoid parsing and
-        // retaining its JSON allocations in GMS, Play Store, and other target apps.
-        if (pkgName == PHOTOS_PACKAGE && !photosConfigVector.empty()) {
-            std::string photosString(photosConfigVector.begin(), photosConfigVector.end());
-            photosJson = nlohmann::json::parse(propToJson(photosString), nullptr, false, true);
-            if (photosJson.is_discarded()) photosJson.clear();
-        }
-        // Release the payload buffer in every process; clear() alone retains capacity.
-        std::vector<char>().swap(photosConfigVector);
 
         if (pkgName == VENDING_PACKAGE)
             spoofBuild = spoofProps = spoofProvider = spoofSignature = 0;
         else
             spoofVendingFinger = spoofVendingSdk = spoofPatch = spoofPixel = 0;
 
-        bool isDroidGuardOrVending =
-                processName == DROIDGUARD_PACKAGE ||
-                pkgName == VENDING_PACKAGE;
-
         if (isTargetApp && spoofApps > 0) {
-            // Do not inject into a process already protected by PairIP
             if (hasPairIpCoreLoaded()) {
                 LOGD("PairIP detected in target process; skipping per-app spoofing");
             } else if (loadAppProfile()) {
@@ -921,64 +644,32 @@ public:
         } else if (isDroidGuardOrVending) {
             if (isPaused()) {
                 LOGD("Paused: stop flag exists, skipping injection for %s", pkgName.c_str());
-
-                dexVector.clear();
-                json.clear();
-                return;
-            }
-
-            LOGD("Resume state: Continuing injection for %s", pkgName.c_str());
-
-            if (spoofProps > 0 && !installPropertyVirtualizer(json))
-                doHook();
-
-            if (spoofBuild +
-                spoofProvider +
-                spoofSignature +
-                spoofVendingFinger +
-                spoofVendingSdk +
-                spoofPatch +
-                spoofPixel > 0) {
-                inject();
+            } else {
+                spoofSystem();
             }
         } else if (pkgName == PHOTOS_PACKAGE) {
-            if (spoofPhotos > 0 && !photosJson.empty()) {
-                readPhotosJson();
-                if (!installPhotosVirtualizer()) {
-                    jsonProps = photosJsonProps;
-                    LOGD("Photos property virtualizer unavailable; using isolated Photos-only fallback (%d props)",
-                         static_cast<int>(jsonProps.size()));
-                    doHook();
-                }
-                if (!photosJson.empty()) injectPhotos();
-            } else {
-                LOGD("Photos spoofing disabled or sailfish.prop missing (spoofPhotos=%d)", spoofPhotos);
-            }
+            spoofPhotosApp();
         }
 
-        dexVector.clear();
-        json.clear();
-        appJson.clear();
-        appJsonProps.clear();
-        appProfileData.clear();
-        photosJson.clear();
-        photosJsonProps.clear();
-        photosConfigVector.clear();
+        releasePayload();
     }
 
-    void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
-        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
+        unload();
     }
 
 private:
+    enum class Pop { Absent, Invalid, Ok };
+
     zygisk::Api *api = nullptr;
     JNIEnv *env = nullptr;
 
     std::vector<char> dexVector;
-    std::vector<char> photosConfigVector;
+    std::string photosConfig;
     nlohmann::json json;
     std::string pkgName;
     std::string processName;
+
     std::string vendingFingerprintValue;
     std::string manufacturerValue;
     std::string brandValue;
@@ -993,832 +684,475 @@ private:
     std::string securityPatchValue;
 
     bool isTargetApp = false;
+    bool isDroidGuardOrVending = false;
+
+    void unload() {
+        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+    }
+
+    // The DEX is only cleared, not freed: the in-memory class loader keeps referencing it.
+    void releasePayload() {
+        dexVector.clear();
+        json = nlohmann::json::object();
+        appJson = nlohmann::json::object();
+        photosJson = nlohmann::json::object();
+        appJsonProps.clear();
+        photosJsonProps.clear();
+        std::string().swap(appProfileData);
+        std::string().swap(photosConfig);
+    }
+
+    void resolveNames(zygisk::AppSpecializeArgs *args) {
+        ScopedUtf process(env, args->nice_name);
+        ScopedUtf dir(env, args->app_data_dir);
+
+        processName = process.get() != nullptr ? process.get() : "";
+
+        if (dir.get() != nullptr) {
+            const std::string_view path(dir.get());
+            const size_t slash = path.find_last_of('/');
+            pkgName = std::string(slash == std::string_view::npos ? path : path.substr(slash + 1));
+        } else {
+            pkgName = processName.substr(0, processName.find(':'));
+        }
+    }
+
+    bool fetchPayload() {
+        ScopedFd fd(api->connectCompanion());
+        if (fd.get() < 0) {
+            LOGD("Couldn't connect to companion");
+            return false;
+        }
+
+        PayloadHeader header{};
+        if (!readFully(fd.get(), &header, sizeof(header))) {
+            LOGD("Couldn't read companion header");
+            return false;
+        }
+
+        if (!inRange(header.dexSize, 1, MAX_DEX_PAYLOAD) ||
+            !inRange(header.configSize, 1, MAX_CONFIG_PAYLOAD) ||
+            !inRange(header.appProfileSize, 0, MAX_APP_PROFILE_PAYLOAD) ||
+            !inRange(header.photosConfigSize, 0, MAX_CONFIG_PAYLOAD)) {
+            LOGD("Companion returned invalid payload sizes (dex=%lld, config=%lld, profile=%lld, photos=%lld)",
+                 static_cast<long long>(header.dexSize), static_cast<long long>(header.configSize),
+                 static_cast<long long>(header.appProfileSize),
+                 static_cast<long long>(header.photosConfigSize));
+            return false;
+        }
+
+        LOGD("Companion payload: dex=%lld, config=%lld, profile=%lld, photos=%lld bytes",
+             static_cast<long long>(header.dexSize), static_cast<long long>(header.configSize),
+             static_cast<long long>(header.appProfileSize),
+             static_cast<long long>(header.photosConfigSize));
+
+        std::string configString;
+        if (!readBlob(fd.get(), header.dexSize, dexVector) ||
+            !readBlob(fd.get(), header.configSize, configString) ||
+            !readBlob(fd.get(), header.appProfileSize, appProfileData) ||
+            !readBlob(fd.get(), header.photosConfigSize, photosConfig)) {
+            LOGD("Couldn't read companion payload");
+            return false;
+        }
+
+        json = parseConfig(configString, false);
+        return true;
+    }
+
+    template <typename Container>
+    static bool readBlob(int fd, int64_t size, Container &out) {
+        out.resize(static_cast<size_t>(size));
+        return size == 0 || readFully(fd, out.data(), out.size());
+    }
+
+    static bool hasPairIpCoreLoaded() {
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (maps == nullptr) return false;
+
+        char line[1024];
+        bool found = false;
+        while (!found && fgets(line, sizeof(line), maps))
+            found = strstr(line, "libpairipcore.so") != nullptr;
+
+        fclose(maps);
+        return found;
+    }
+
+    // --- config parsing ----------------------------------------------------
+
+    Pop popString(const char *key, std::string &out) {
+        const auto it = json.find(key);
+        if (it == json.end()) return Pop::Absent;
+
+        Pop result = Pop::Invalid;
+        if (it->is_string()) {
+            out = it->get<std::string>();
+            if (!out.empty()) result = Pop::Ok;
+        }
+        json.erase(it);
+        return result;
+    }
+
+    void popFlag(const char *key, int &target, const char *label) {
+        std::string raw;
+        switch (popString(key, raw)) {
+            case Pop::Absent:
+                return;
+            case Pop::Invalid:
+                LOGD("Error parsing %s!", key);
+                return;
+            case Pop::Ok:
+                target = parseIntOrKeep(raw, target, key);
+                if (label != nullptr && verboseLogs > 0)
+                    LOGD("%s %s!", label, target > 0 ? "enabled" : "disabled");
+                return;
+        }
+    }
+
+    void popVendingFingerprint() {
+        std::string raw;
+        const Pop state = popString("spoofVendingFinger", raw);
+        if (state == Pop::Absent) return;
+        if (state == Pop::Invalid) {
+            LOGD("Error parsing spoofVendingFinger!");
+            return;
+        }
+
+        const std::string fingerprint = jsonString(json, "FINGERPRINT");
+        if (raw.find_first_not_of("01") != std::string::npos) {
+            spoofVendingFinger = 1;
+            vendingFingerprintValue = raw;
+        } else if (!fingerprint.empty()) {
+            spoofVendingFinger = parseIntOrKeep(raw, spoofVendingFinger, "spoofVendingFinger");
+            vendingFingerprintValue = fingerprint;
+        } else {
+            LOGD("Error parsing spoofVendingFinger or FINGERPRINT field!");
+            return;
+        }
+
+        if (verboseLogs > 0)
+            LOGD("Spoofing Fingerprint in Play Store %s!", spoofVendingFinger > 0 ? "enabled" : "disabled");
+    }
 
     void readJson() {
         LOGD("JSON contains %d keys!", static_cast<int>(json.size()));
 
-        if (json.contains("verboseLogs")) {
-            if (!json["verboseLogs"].is_null() &&
-                json["verboseLogs"].is_string() &&
-                json["verboseLogs"] != "") {
+        popFlag("verboseLogs", verboseLogs, nullptr);
+        if (verboseLogs > 0) LOGD("Verbose logging (level %d) enabled!", verboseLogs);
 
-                verboseLogs = parseIntOrKeep(json["verboseLogs"].get<std::string>(), verboseLogs, "verboseLogs");
+        popFlag("spoofVendingSdk", spoofVendingSdk, "Spoofing SDK Level in Play Store");
+        popFlag("spoofPatch", spoofPatch, "Spoofing Android release and security patch");
+        popVendingFingerprint();
+        popFlag("spoofPixel", spoofPixel, "Spoofing Pixel Fields in Play Store");
+        popFlag("spoofApps", spoofApps, "Per-app spoofing");
+        popFlag("spoofPhotos", spoofPhotos, "Photos spoofing");
 
-                if (verboseLogs > 0)
-                    LOGD("Verbose logging (level %d) enabled!", verboseLogs);
-            } else {
-                LOGD("Error parsing verboseLogs!");
-            }
-
-            json.erase("verboseLogs");
-        }
-
-        if (json.contains("spoofVendingSdk")) {
-            if (!json["spoofVendingSdk"].is_null() &&
-                json["spoofVendingSdk"].is_string() &&
-                json["spoofVendingSdk"] != "") {
-
-                spoofVendingSdk = parseIntOrKeep(json["spoofVendingSdk"].get<std::string>(), spoofVendingSdk, "spoofVendingSdk");
-
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Spoofing SDK Level in Play Store %s!",
-                            (spoofVendingSdk > 0) ? "enabled" : "disabled"
-                    );
-            } else {
-                LOGD("Error parsing spoofVendingSdk!");
-            }
-
-            json.erase("spoofVendingSdk");
-        }
-
-        if (json.contains("spoofPatch")) {
-            if (!json["spoofPatch"].is_null() &&
-                json["spoofPatch"].is_string() &&
-                json["spoofPatch"] != "") {
-
-                spoofPatch = parseIntOrKeep(json["spoofPatch"].get<std::string>(), spoofPatch, "spoofPatch");
-
-                if (verboseLogs > 0)
-                    LOGD("Spoofing Android release and security patch %s!",
-                         (spoofPatch > 0) ? "enabled" : "disabled");
-            } else {
-                LOGD("Error parsing spoofPatch!");
-            }
-
-            json.erase("spoofPatch");
-        }
-
-        if (json.contains("spoofVendingFinger")) {
-            if (!json["spoofVendingFinger"].is_null() &&
-                json["spoofVendingFinger"].is_string() &&
-                json["spoofVendingFinger"] != "") {
-
-                if (json["spoofVendingFinger"].get<std::string>().find_first_not_of("01") !=
-                    std::string::npos) {
-
-                    spoofVendingFinger = 1;
-                    vendingFingerprintValue =
-                            json["spoofVendingFinger"].get<std::string>();
-
-                } else if (json.contains("FINGERPRINT") &&
-                           !json["FINGERPRINT"].is_null() &&
-                           json["FINGERPRINT"].is_string() &&
-                           json["FINGERPRINT"] != "") {
-
-                    spoofVendingFinger =
-                            parseIntOrKeep(json["spoofVendingFinger"].get<std::string>(), spoofVendingFinger, "spoofVendingFinger");
-
-                    vendingFingerprintValue =
-                            json["FINGERPRINT"].get<std::string>();
-                } else {
-                    LOGD("Error parsing spoofVendingFinger or FINGERPRINT field!");
-                }
-
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Spoofing Fingerprint in Play Store %s!",
-                            (spoofVendingFinger > 0) ? "enabled" : "disabled"
-                    );
-            } else {
-                LOGD("Error parsing spoofVendingFinger!");
-            }
-
-            json.erase("spoofVendingFinger");
-        }
-
-        if (json.contains("spoofPixel")) {
-            if (!json["spoofPixel"].is_null() &&
-                json["spoofPixel"].is_string() &&
-                json["spoofPixel"] != "") {
-
-                spoofPixel = parseIntOrKeep(json["spoofPixel"].get<std::string>(), spoofPixel, "spoofPixel");
-
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Spoofing Pixel Fields in Play Store %s!",
-                            (spoofPixel > 0) ? "enabled" : "disabled"
-                    );
-            } else {
-                LOGD("Error parsing spoofPixel!");
-            }
-
-            json.erase("spoofPixel");
-        }
-
-        if (json.contains("spoofApps")) {
-            if (!json["spoofApps"].is_null() &&
-                json["spoofApps"].is_string() &&
-                json["spoofApps"] != "") {
-
-                spoofApps = parseIntOrKeep(json["spoofApps"].get<std::string>(), spoofApps, "spoofApps");
-
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Per-app spoofing %s!",
-                            (spoofApps > 0) ? "enabled" : "disabled"
-                    );
-            } else {
-                LOGD("Error parsing spoofApps!");
-            }
-
-            json.erase("spoofApps");
-        }
-
-        if (json.contains("spoofPhotos")) {
-            if (json["spoofPhotos"].is_string() && !json["spoofPhotos"].get<std::string>().empty()) {
-                spoofPhotos = parseIntOrKeep(json["spoofPhotos"].get<std::string>(), spoofPhotos, "spoofPhotos");
-                LOGD("Photos flag parsed from general config: %s (value=%d)",
-                     spoofPhotos > 0 ? "enabled" : "disabled", spoofPhotos);
-            } else {
-                LOGD("Photos flag exists but has an invalid type or empty value; retaining value=%d", spoofPhotos);
-            }
-            json.erase("spoofPhotos");
-        } else {
-            LOGD("Photos flag 'spoofPhotos' is absent from the selected general config; default remains %d", spoofPhotos);
-        }
-
-        auto readStringField = [this](const char *key, std::string &target) {
-            if (json.contains(key) && json[key].is_string()) {
-                target = json[key].get<std::string>();
-            }
+        const std::pair<const char *, std::string *> stringFields[] = {
+            {"MANUFACTURER", &manufacturerValue}, {"BRAND", &brandValue},
+            {"MODEL", &modelValue},               {"PRODUCT", &productValue},
+            {"DEVICE", &deviceValue},             {"ID", &idValue},
+            {"INCREMENTAL", &incrementalValue},   {"TYPE", &typeValue},
+            {"TAGS", &tagsValue},                 {"RELEASE", &releaseValue},
+            {"SECURITY_PATCH", &securityPatchValue},
         };
-
-        readStringField("MANUFACTURER", manufacturerValue);
-        readStringField("BRAND", brandValue);
-        readStringField("MODEL", modelValue);
-        readStringField("PRODUCT", productValue);
-        readStringField("DEVICE", deviceValue);
-        readStringField("ID", idValue);
-        readStringField("INCREMENTAL", incrementalValue);
-        readStringField("TYPE", typeValue);
-        readStringField("TAGS", tagsValue);
-        readStringField("RELEASE", releaseValue);
-        readStringField("SECURITY_PATCH", securityPatchValue);
+        for (const auto &[key, target] : stringFields) {
+            const auto it = json.find(key);
+            if (it != json.end() && it->is_string()) *target = it->get<std::string>();
+        }
 
         if (pkgName == VENDING_PACKAGE) {
-            json.clear();
+            json = nlohmann::json::object();
             return;
         }
 
-        if (json.contains("spoofBuild")) {
-            if (!json["spoofBuild"].is_null() &&
-                json["spoofBuild"].is_string() &&
-                json["spoofBuild"] != "") {
+        popFlag("spoofBuild", spoofBuild, "Spoofing Build Fields");
+        popFlag("spoofProps", spoofProps, "Spoofing System Properties");
+        popFlag("spoofProvider", spoofProvider, "Spoofing Keystore Provider");
+        popFlag("spoofSignature", spoofSignature, "Spoofing ROM Signature");
 
-                spoofBuild = parseIntOrKeep(json["spoofBuild"].get<std::string>(), spoofBuild, "spoofBuild");
+        for (auto it = json.begin(); it != json.end();) {
+            const std::string key = it.key();
+            if (key.find_first_of("*.") == std::string::npos) {
+                ++it;
+                continue;
+            }
 
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Spoofing Build Fields %s!",
-                            (spoofBuild > 0) ? "enabled" : "disabled"
-                    );
+            if (verboseLogs > 1) LOGD("Parsing %s", key.c_str());
+
+            if (!it.value().is_string()) {
+                LOGD("Error parsing %s!", key.c_str());
+            } else if (it.value().get<std::string>().empty()) {
+                LOGD("%s is empty, skipping", key.c_str());
             } else {
-                LOGD("Error parsing spoofBuild!");
+                if (verboseLogs > 0) LOGD("Adding '%s' to properties list", key.c_str());
+                jsonProps[key] = it.value().get<std::string>();
             }
+            it = json.erase(it);
+        }
+    }
 
-            json.erase("spoofBuild");
+    // --- spoofing entry points -----------------------------------------------
+
+    void spoofSystem() {
+        LOGD("Resume state: Continuing injection for %s", pkgName.c_str());
+
+        if (spoofProps > 0 && !installVirtualizer(jsonProps, json, true))
+            doHook();
+
+        if (spoofBuild + spoofProvider + spoofSignature +
+            spoofVendingFinger + spoofVendingSdk + spoofPatch + spoofPixel > 0) {
+            inject();
+        }
+    }
+
+    void spoofPhotosApp() {
+        if (spoofPhotos <= 0 || photosConfig.empty()) {
+            LOGD("Photos spoofing disabled or sailfish.prop missing (spoofPhotos=%d)", spoofPhotos);
+            return;
         }
 
-        if (json.contains("spoofProps")) {
-            if (!json["spoofProps"].is_null() &&
-                json["spoofProps"].is_string() &&
-                json["spoofProps"] != "") {
+        photosJson = parseConfig(photosConfig, true);
+        if (photosJson.empty()) return;
 
-                spoofProps = parseIntOrKeep(json["spoofProps"].get<std::string>(), spoofProps, "spoofProps");
+        readPhotosJson();
+        if (!photosJsonProps.empty() && !installVirtualizer(photosJsonProps, photosJson, false)) {
+            jsonProps = photosJsonProps;
+            LOGD("Photos property virtualizer unavailable; using Photos-only fallback (%d props)",
+                 static_cast<int>(jsonProps.size()));
+            doHook();
+        }
+        if (!photosJson.empty()) injectPhotos();
+    }
 
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Spoofing System Properties %s!",
-                            (spoofProps > 0) ? "enabled" : "disabled"
-                    );
-            } else {
-                LOGD("Error parsing spoofProps!");
-            }
+    // --- JNI injection ---------------------------------------------------------
 
-            json.erase("spoofProps");
+    // Must be called with a ScopedLocalFrame active; every local ref created here dies with it.
+    jclass loadEntryClass(const char *className, const char *tag) {
+        if (dexVector.empty()) {
+            LOGD("JNI %s: module DEX is empty; skipping injection", tag);
+            return nullptr;
         }
 
-        if (json.contains("spoofProvider")) {
-            if (!json["spoofProvider"].is_null() &&
-                json["spoofProvider"].is_string() &&
-                json["spoofProvider"] != "") {
+        LOGD("JNI %s: Creating module classloader", tag);
 
-                spoofProvider = parseIntOrKeep(json["spoofProvider"].get<std::string>(), spoofProvider, "spoofProvider");
+        jclass classLoaderClass = env->FindClass("java/lang/ClassLoader");
+        if (checkJniException(env, "FindClass(ClassLoader)") || classLoaderClass == nullptr)
+            return nullptr;
 
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Spoofing Keystore Provider %s!",
-                            (spoofProvider > 0) ? "enabled" : "disabled"
-                    );
-            } else {
-                LOGD("Error parsing spoofProvider!");
-            }
+        jmethodID getSystemClassLoader = env->GetStaticMethodID(
+                classLoaderClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+        if (checkJniException(env, "getSystemClassLoader lookup") || getSystemClassLoader == nullptr)
+            return nullptr;
 
-            json.erase("spoofProvider");
+        jobject systemClassLoader = env->CallStaticObjectMethod(classLoaderClass, getSystemClassLoader);
+        if (checkJniException(env, "getSystemClassLoader call") || systemClassLoader == nullptr)
+            return nullptr;
+
+        jclass dexClassLoaderClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        if (checkJniException(env, "FindClass(InMemoryDexClassLoader)") || dexClassLoaderClass == nullptr)
+            return nullptr;
+
+        jmethodID dexClassLoaderInit = env->GetMethodID(
+                dexClassLoaderClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        if (checkJniException(env, "InMemoryDexClassLoader constructor lookup") ||
+            dexClassLoaderInit == nullptr)
+            return nullptr;
+
+        jobject buffer = env->NewDirectByteBuffer(dexVector.data(), static_cast<jlong>(dexVector.size()));
+        if (checkJniException(env, "NewDirectByteBuffer") || buffer == nullptr) return nullptr;
+
+        jobject dexClassLoader = env->NewObject(dexClassLoaderClass, dexClassLoaderInit, buffer, systemClassLoader);
+        if (checkJniException(env, "NewObject(InMemoryDexClassLoader)") || dexClassLoader == nullptr)
+            return nullptr;
+
+        LOGD("JNI %s: Loading module class", tag);
+
+        jmethodID loadClass = env->GetMethodID(
+                classLoaderClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        if (checkJniException(env, "ClassLoader.loadClass lookup") || loadClass == nullptr)
+            return nullptr;
+
+        jstring name = env->NewStringUTF(className);
+        if (checkJniException(env, "NewStringUTF(className)") || name == nullptr) return nullptr;
+
+        auto entryClass = static_cast<jclass>(env->CallObjectMethod(dexClassLoader, loadClass, name));
+        if (checkJniException(env, "loadClass call") || entryClass == nullptr) {
+            LOGD("JNI %s: unable to load '%s'; skipping injection", tag, className);
+            return nullptr;
         }
 
-        if (json.contains("spoofSignature")) {
-            if (!json["spoofSignature"].is_null() &&
-                json["spoofSignature"].is_string() &&
-                json["spoofSignature"] != "") {
-
-                spoofSignature = parseIntOrKeep(json["spoofSignature"].get<std::string>(), spoofSignature, "spoofSignature");
-
-                if (verboseLogs > 0)
-                    LOGD(
-                            "Spoofing ROM Signature %s!",
-                            (spoofSignature > 0) ? "enabled" : "disabled"
-                    );
-            } else {
-                LOGD("Error parsing spoofSignature!");
-            }
-
-            json.erase("spoofSignature");
+        const JNINativeMethod methods[] = {
+            {const_cast<char *>("setFieldNative"),
+             const_cast<char *>("(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V"),
+             reinterpret_cast<void *>(setFieldNative)},
+        };
+        const jint result = env->RegisterNatives(entryClass, methods, 1);
+        if (checkJniException(env, "RegisterNatives") || result != JNI_OK) {
+            LOGD("JNI %s: native method registration failed; skipping injection", tag);
+            return nullptr;
         }
 
-        std::vector<std::string> eraseKeys;
+        return entryClass;
+    }
 
-        for (auto &jsonList : json.items()) {
-            if (verboseLogs > 1)
-                LOGD("Parsing %s", jsonList.key().c_str());
+    bool sendJson(jclass entryClass, const nlohmann::json &payload, const char *tag) {
+        LOGD("JNI %s: Sending JSON", tag);
 
-            if (jsonList.key().find_first_of("*.") != std::string::npos) {
-                if (!jsonList.value().is_null() &&
-                    jsonList.value().is_string()) {
-
-                    if (jsonList.value() == "") {
-                        LOGD(
-                                "%s is empty, skipping",
-                                jsonList.key().c_str()
-                        );
-                    } else {
-                        if (verboseLogs > 0)
-                            LOGD(
-                                    "Adding '%s' to properties list",
-                                    jsonList.key().c_str()
-                            );
-
-                        jsonProps[jsonList.key()] = jsonList.value();
-                    }
-                } else {
-                    LOGD(
-                            "Error parsing %s!",
-                            jsonList.key().c_str()
-                    );
-                }
-
-                eraseKeys.push_back(jsonList.key());
-            }
+        jmethodID receiveJson = env->GetStaticMethodID(entryClass, "receiveJson", "(Ljava/lang/String;)V");
+        if (checkJniException(env, "receiveJson lookup") || receiveJson == nullptr) {
+            LOGD("JNI %s: receiveJson lookup failed; skipping injection", tag);
+            return false;
         }
 
-        for (auto key : eraseKeys) {
-            if (json.contains(key))
-                json.erase(key);
-        }
+        jstring javaJson = env->NewStringUTF(payload.dump().c_str());
+        if (checkJniException(env, "JSON allocation") || javaJson == nullptr) return false;
+
+        env->CallStaticVoidMethod(entryClass, receiveJson, javaJson);
+        return !checkJniException(env, "receiveJson call");
     }
 
     void inject() {
-        ScopedLocalFrame localFrame(env, 64);
-        if (!localFrame.valid() || dexVector.empty()) {
-            LOGD("JNI: unable to allocate local frame or module DEX is empty; skipping injection");
+        const bool vending = pkgName == VENDING_PACKAGE;
+        const char *tag = vending ? "PS" : "DG";
+
+        ScopedLocalFrame frame(env, 64);
+        if (!frame.valid()) return;
+
+        jclass entryClass = loadEntryClass(vending ? ENTRY_CLASS_VENDING : ENTRY_CLASS_DROIDGUARD, tag);
+        if (entryClass == nullptr) return;
+
+        if (vending) initVending(entryClass);
+        else initDroidGuard(entryClass);
+    }
+
+    void initVending(jclass entryClass) {
+        LOGD("JNI PS: Calling EntryPointVending.init");
+
+        jmethodID init = env->GetStaticMethodID(
+                entryClass, "init",
+                "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+                "Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+                "Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V");
+        if (checkJniException(env, "EntryPointVending.init lookup") || init == nullptr) {
+            LOGD("JNI PS: EntryPointVending.init lookup failed; skipping injection");
             return;
         }
 
-        const char *niceName =
-                pkgName == VENDING_PACKAGE ? "PS" : "DG";
-
-        LOGD("JNI %s: Getting system classloader", niceName);
-
-        auto clClass =
-                env->FindClass("java/lang/ClassLoader");
-        if (checkJniException(env, "FindClass(ClassLoader)") || clClass == nullptr) return;
-
-        auto getSystemClassLoader =
-                env->GetStaticMethodID(
-                        clClass,
-                        "getSystemClassLoader",
-                        "()Ljava/lang/ClassLoader;"
-                );
-        if (checkJniException(env, "getSystemClassLoader lookup") || getSystemClassLoader == nullptr) return;
-
-        auto systemClassLoader =
-                env->CallStaticObjectMethod(
-                        clClass,
-                        getSystemClassLoader
-                );
-        if (checkJniException(env, "getSystemClassLoader call") || systemClassLoader == nullptr) return;
-
-        LOGD("JNI %s: Creating module classloader", niceName);
-
-        auto dexClClass =
-                env->FindClass("dalvik/system/InMemoryDexClassLoader");
-        if (checkJniException(env, "FindClass(InMemoryDexClassLoader)") || dexClClass == nullptr) return;
-
-        auto dexClInit =
-                env->GetMethodID(
-                        dexClClass,
-                        "<init>",
-                        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"
-                );
-        if (checkJniException(env, "InMemoryDexClassLoader constructor lookup") || dexClInit == nullptr) return;
-
-        auto buffer =
-                env->NewDirectByteBuffer(
-                        dexVector.data(),
-                        static_cast<jlong>(dexVector.size())
-                );
-        if (checkJniException(env, "NewDirectByteBuffer") || buffer == nullptr) return;
-
-        auto dexCl =
-                env->NewObject(
-                        dexClClass,
-                        dexClInit,
-                        buffer,
-                        systemClassLoader
-                );
-        if (checkJniException(env, "NewObject(InMemoryDexClassLoader)") || dexCl == nullptr) return;
-
-        LOGD("JNI %s: Loading module class", niceName);
-
-        auto loadClass =
-                env->GetMethodID(
-                        clClass,
-                        "loadClass",
-                        "(Ljava/lang/String;)Ljava/lang/Class;"
-                );
-        if (checkJniException(env, "ClassLoader.loadClass lookup") || loadClass == nullptr) return;
-
-        const char *className =
-                pkgName == VENDING_PACKAGE
-                ? "es.chiteroman.playintegrityfix.EntryPointVending"
-                : "es.chiteroman.playintegrityfix.EntryPoint";
-
-        auto entryClassName =
-                env->NewStringUTF(className);
-        if (checkJniException(env, "NewStringUTF(className)") || entryClassName == nullptr) return;
-
-        auto entryClassObj =
-                env->CallObjectMethod(
-                        dexCl,
-                        loadClass,
-                        entryClassName
-                );
-
-        if (env->ExceptionCheck()) {
-            LOGD(
-                    "JNI %s: Exception while loading class '%s', clearing and aborting injection",
-                    niceName,
-                    className
-            );
-
-            env->ExceptionClear();
-
-            env->DeleteLocalRef(clClass);
-            env->DeleteLocalRef(systemClassLoader);
-            env->DeleteLocalRef(dexClClass);
-            env->DeleteLocalRef(buffer);
-            env->DeleteLocalRef(dexCl);
-            env->DeleteLocalRef(entryClassName);
-
-            return;
-        }
-
-        if (entryClassObj == nullptr) {
-            LOGD(
-                    "JNI %s: loadClass('%s') returned null, aborting injection",
-                    niceName,
-                    className
-            );
-
-            env->DeleteLocalRef(clClass);
-            env->DeleteLocalRef(systemClassLoader);
-            env->DeleteLocalRef(dexClClass);
-            env->DeleteLocalRef(buffer);
-            env->DeleteLocalRef(dexCl);
-            env->DeleteLocalRef(entryClassName);
-
-            return;
-        }
-
-        auto entryClass =
-                (jclass) entryClassObj;
-
-        JNINativeMethod methods[] = {
-            {
-                "setFieldNative",
-                "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V",
-                (void *) setFieldNative
-            }
+        const std::string *values[] = {
+            &vendingFingerprintValue, &manufacturerValue, &brandValue, &modelValue,
+            &productValue, &deviceValue, &idValue, &incrementalValue, &typeValue,
+            &tagsValue, &releaseValue, &securityPatchValue,
         };
-
-        const jint registerResult = env->RegisterNatives(
-                entryClass,
-                methods,
-                1
-        );
-        if (checkJniException(env, "RegisterNatives") || registerResult != JNI_OK) {
-            LOGD("JNI %s: native method registration failed; skipping injection", niceName);
+        jstring s[std::size(values)];
+        bool allocated = true;
+        for (size_t i = 0; i < std::size(values); ++i) {
+            s[i] = env->NewStringUTF(values[i]->c_str());
+            allocated = allocated && s[i] != nullptr;
+        }
+        if (checkJniException(env, "Play Store argument allocation") || !allocated) {
+            LOGD("JNI PS: failed to allocate initialization arguments; skipping injection");
             return;
         }
 
-        if (pkgName == VENDING_PACKAGE) {
-            LOGD(
-                    "JNI %s: Calling EntryPointVending.init",
-                    niceName
-            );
+        env->CallStaticVoidMethod(entryClass, init,
+                                  verboseLogs, spoofVendingFinger, spoofVendingSdk, s[0], spoofPixel,
+                                  s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9],
+                                  spoofPatch, s[10], s[11]);
+        checkJniException(env, "EntryPointVending.init call");
+    }
 
-            auto entryInit =
-                    env->GetStaticMethodID(
-                            entryClass,
-                            "init",
-                            "(IIILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V"
-                    );
+    void initDroidGuard(jclass entryClass) {
+        if (!sendJson(entryClass, json, "DG")) return;
 
-            if (entryInit == nullptr || env->ExceptionCheck()) {
-                LOGD("JNI %s: EntryPointVending.init method lookup failed; skipping injection", niceName);
-                if (env->ExceptionCheck()) env->ExceptionClear();
-            } else {
-            auto javaStr =
-                    env->NewStringUTF(
-                            vendingFingerprintValue.c_str()
-                    );
+        LOGD("JNI DG: Calling EntryPoint.init");
 
-            auto manufacturerStr =
-                    env->NewStringUTF(manufacturerValue.c_str());
+        jmethodID init = env->GetStaticMethodID(entryClass, "init", "(IIII)V");
+        if (checkJniException(env, "EntryPoint.init lookup") || init == nullptr) return;
 
-            auto brandStr =
-                    env->NewStringUTF(brandValue.c_str());
-
-            auto modelStr =
-                    env->NewStringUTF(modelValue.c_str());
-
-            auto productStr =
-                    env->NewStringUTF(productValue.c_str());
-
-            auto deviceStr =
-                    env->NewStringUTF(deviceValue.c_str());
-
-            auto idStr =
-                    env->NewStringUTF(idValue.c_str());
-
-            auto incrementalStr =
-                    env->NewStringUTF(incrementalValue.c_str());
-
-            auto typeStr =
-                    env->NewStringUTF(typeValue.c_str());
-
-            auto tagsStr =
-                    env->NewStringUTF(tagsValue.c_str());
-
-            auto releaseStr =
-                    env->NewStringUTF(releaseValue.c_str());
-
-            auto securityPatchStr =
-                    env->NewStringUTF(securityPatchValue.c_str());
-
-            if (checkJniException(env, "Play Store argument allocation") ||
-                javaStr == nullptr || manufacturerStr == nullptr || brandStr == nullptr ||
-                modelStr == nullptr || productStr == nullptr || deviceStr == nullptr ||
-                idStr == nullptr || incrementalStr == nullptr || typeStr == nullptr ||
-                tagsStr == nullptr || releaseStr == nullptr || securityPatchStr == nullptr) {
-                LOGD("JNI PS: failed to allocate initialization arguments; skipping injection");
-                return;
-            }
-
-            env->CallStaticVoidMethod(
-                    entryClass,
-                    entryInit,
-                    verboseLogs,
-                    spoofVendingFinger,
-                    spoofVendingSdk,
-                    javaStr,
-                    spoofPixel,
-                    manufacturerStr,
-                    brandStr,
-                    modelStr,
-                    productStr,
-                    deviceStr,
-                    idStr,
-                    incrementalStr,
-                    typeStr,
-                    tagsStr,
-                    spoofPatch,
-                    releaseStr,
-                    securityPatchStr
-            );
-            checkJniException(env, "EntryPointVending.init call");
-
-            env->DeleteLocalRef(javaStr);
-            env->DeleteLocalRef(manufacturerStr);
-            env->DeleteLocalRef(brandStr);
-            env->DeleteLocalRef(modelStr);
-            env->DeleteLocalRef(productStr);
-            env->DeleteLocalRef(deviceStr);
-            env->DeleteLocalRef(idStr);
-            env->DeleteLocalRef(incrementalStr);
-            env->DeleteLocalRef(typeStr);
-            env->DeleteLocalRef(tagsStr);
-            env->DeleteLocalRef(releaseStr);
-            env->DeleteLocalRef(securityPatchStr);
-            }
-        } else {
-            LOGD(
-                    "JNI %s: Sending JSON",
-                    niceName
-            );
-
-            auto receiveJson =
-                    env->GetStaticMethodID(
-                            entryClass,
-                            "receiveJson",
-                            "(Ljava/lang/String;)V"
-                    );
-
-            if (checkJniException(env, "EntryPoint.receiveJson lookup") || receiveJson == nullptr) {
-                LOGD("JNI DG: EntryPoint.receiveJson lookup failed; skipping injection");
-                return;
-            }
-
-            auto javaStr =
-                    env->NewStringUTF(
-                            json.dump().c_str()
-                    );
-            if (checkJniException(env, "EntryPoint JSON allocation") || javaStr == nullptr) return;
-
-            env->CallStaticVoidMethod(
-                    entryClass,
-                    receiveJson,
-                    javaStr
-            );
-            if (checkJniException(env, "EntryPoint.receiveJson call")) return;
-
-            LOGD(
-                    "JNI %s: Calling EntryPoint.init",
-                    niceName
-            );
-
-            auto entryInit =
-                    env->GetStaticMethodID(
-                            entryClass,
-                            "init",
-                            "(IIII)V"
-                    );
-            if (checkJniException(env, "EntryPoint.init lookup") || entryInit == nullptr) return;
-
-            env->CallStaticVoidMethod(
-                    entryClass,
-                    entryInit,
-                    verboseLogs,
-                    spoofBuild,
-                    spoofProvider,
-                    spoofSignature
-            );
-            checkJniException(env, "EntryPoint.init call");
-
-            env->DeleteLocalRef(javaStr);
-        }
-
-        env->DeleteLocalRef(clClass);
-        env->DeleteLocalRef(systemClassLoader);
-        env->DeleteLocalRef(dexClClass);
-        env->DeleteLocalRef(buffer);
-        env->DeleteLocalRef(dexCl);
-        env->DeleteLocalRef(entryClassName);
-        env->DeleteLocalRef(entryClassObj);
+        env->CallStaticVoidMethod(entryClass, init, verboseLogs, spoofBuild, spoofProvider, spoofSignature);
+        checkJniException(env, "EntryPoint.init call");
     }
 
     void injectPhotos() {
-        ScopedLocalFrame localFrame(env, 48);
-        if (!localFrame.valid() || dexVector.empty()) {
-            LOGD("JNI PHOTOS: unable to allocate local frame or module DEX is empty; skipping injection");
-            return;
-        }
+        ScopedLocalFrame frame(env, 48);
+        if (!frame.valid()) return;
 
-        auto clClass = env->FindClass("java/lang/ClassLoader");
-        if (!clClass) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
-        auto getSystemClassLoader = env->GetStaticMethodID(clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
-        if (checkJniException(env, "PHOTOS getSystemClassLoader lookup") || getSystemClassLoader == nullptr) return;
-        auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
-        if (checkJniException(env, "PHOTOS getSystemClassLoader call") || systemClassLoader == nullptr) return;
-        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-        if (checkJniException(env, "PHOTOS FindClass(InMemoryDexClassLoader)") || dexClClass == nullptr) return;
-        auto dexClInit = env->GetMethodID(dexClClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-        if (checkJniException(env, "PHOTOS constructor lookup") || dexClInit == nullptr) return;
-        auto buffer = env->NewDirectByteBuffer(dexVector.data(), static_cast<jlong>(dexVector.size()));
-        if (checkJniException(env, "PHOTOS NewDirectByteBuffer") || buffer == nullptr) return;
-        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
-        if (checkJniException(env, "PHOTOS NewObject(InMemoryDexClassLoader)") || dexCl == nullptr) return;
-        auto loadClass = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
-        if (checkJniException(env, "PHOTOS loadClass lookup") || loadClass == nullptr) return;
-        auto entryClassName = env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPointPhotos");
-        if (checkJniException(env, "PHOTOS NewStringUTF") || entryClassName == nullptr) return;
-        auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
-        if (checkJniException(env, "PHOTOS loadClass call") || entryClassObj == nullptr) {
-            LOGD("JNI PHOTOS: EntryPointPhotos unavailable; skipping injection");
-            return;
-        }
+        jclass entryClass = loadEntryClass(ENTRY_CLASS_PHOTOS, "PHOTOS");
+        if (entryClass == nullptr || !sendJson(entryClass, photosJson, "PHOTOS")) return;
 
-        if (entryClassObj) {
-            auto entryClass = (jclass) entryClassObj;
-            JNINativeMethod methods[] = {{"setFieldNative", "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V", (void *) setFieldNative}};
-            const jint registerResult = env->RegisterNatives(entryClass, methods, 1);
-            if (checkJniException(env, "PHOTOS RegisterNatives") || registerResult != JNI_OK) {
-                LOGD("JNI PHOTOS: native method registration failed; skipping injection");
-                return;
-            }
-            auto receiveJson = env->GetStaticMethodID(entryClass, "receiveJson", "(Ljava/lang/String;)V");
-            if (checkJniException(env, "PHOTOS receiveJson lookup") || receiveJson == nullptr) return;
-            auto jsonStr = env->NewStringUTF(photosJson.dump().c_str());
-            if (checkJniException(env, "PHOTOS JSON allocation") || jsonStr == nullptr) return;
-            env->CallStaticVoidMethod(entryClass, receiveJson, jsonStr);
-            if (checkJniException(env, "PHOTOS receiveJson call")) return;
-            auto entryInit = env->GetStaticMethodID(entryClass, "init", "(III)V");
-            if (checkJniException(env, "PHOTOS init lookup") || entryInit == nullptr) return;
-            env->CallStaticVoidMethod(entryClass, entryInit, verboseLogs, 1, 1);
-            checkJniException(env, "PHOTOS init call");
-            if (jsonStr) env->DeleteLocalRef(jsonStr);
-            env->DeleteLocalRef(entryClassObj);
-        } else {
-            LOGD("JNI PHOTOS: EntryPointPhotos unavailable; skipping injection");
-        }
-        if (entryClassName) env->DeleteLocalRef(entryClassName);
-        if (dexCl) env->DeleteLocalRef(dexCl);
-        if (buffer) env->DeleteLocalRef(buffer);
-        env->DeleteLocalRef(dexClClass);
-        env->DeleteLocalRef(systemClassLoader);
-        env->DeleteLocalRef(clClass);
+        jmethodID init = env->GetStaticMethodID(entryClass, "init", "(III)V");
+        if (checkJniException(env, "PHOTOS init lookup") || init == nullptr) return;
+
+        env->CallStaticVoidMethod(entryClass, init, verboseLogs, 1, 1);
+        checkJniException(env, "PHOTOS init call");
     }
 
     void injectApps() {
-        ScopedLocalFrame localFrame(env, 48);
-        if (!localFrame.valid() || dexVector.empty()) {
-            LOGD("JNI APPS: unable to allocate local frame or module DEX is empty; skipping injection");
-            return;
-        }
+        ScopedLocalFrame frame(env, 48);
+        if (!frame.valid()) return;
 
-        LOGD("JNI APPS: Getting system classloader");
-
-        auto clClass =
-                env->FindClass("java/lang/ClassLoader");
-        if (checkJniException(env, "APPS FindClass(ClassLoader)") || clClass == nullptr) return;
-
-        auto getSystemClassLoader =
-                env->GetStaticMethodID(
-                        clClass,
-                        "getSystemClassLoader",
-                        "()Ljava/lang/ClassLoader;"
-                );
-        if (checkJniException(env, "APPS getSystemClassLoader lookup") || getSystemClassLoader == nullptr) return;
-
-        auto systemClassLoader =
-                env->CallStaticObjectMethod(
-                        clClass,
-                        getSystemClassLoader
-                );
-        if (checkJniException(env, "APPS getSystemClassLoader call") || systemClassLoader == nullptr) return;
-
-        LOGD("JNI APPS: Creating module classloader");
-
-        auto dexClClass =
-                env->FindClass("dalvik/system/InMemoryDexClassLoader");
-        if (checkJniException(env, "APPS FindClass(InMemoryDexClassLoader)") || dexClClass == nullptr) return;
-
-        auto dexClInit =
-                env->GetMethodID(
-                        dexClClass,
-                        "<init>",
-                        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"
-                );
-        if (checkJniException(env, "APPS constructor lookup") || dexClInit == nullptr) return;
-
-        auto buffer =
-                env->NewDirectByteBuffer(
-                        dexVector.data(),
-                        static_cast<jlong>(dexVector.size())
-                );
-        if (checkJniException(env, "APPS NewDirectByteBuffer") || buffer == nullptr) return;
-
-        auto dexCl =
-                env->NewObject(
-                        dexClClass,
-                        dexClInit,
-                        buffer,
-                        systemClassLoader
-                );
-        if (checkJniException(env, "APPS NewObject(InMemoryDexClassLoader)") || dexCl == nullptr) return;
-
-        LOGD("JNI APPS: Loading module class");
-
-        auto loadClass =
-                env->GetMethodID(
-                        clClass,
-                        "loadClass",
-                        "(Ljava/lang/String;)Ljava/lang/Class;"
-                );
-        if (checkJniException(env, "APPS loadClass lookup") || loadClass == nullptr) return;
-
-        auto entryClassName =
-                env->NewStringUTF(
-                        "es.chiteroman.playintegrityfix.EntryPointApps"
-                );
-        if (checkJniException(env, "APPS NewStringUTF") || entryClassName == nullptr) return;
-
-        auto entryClassObj =
-                env->CallObjectMethod(
-                        dexCl,
-                        loadClass,
-                        entryClassName
-                );
-
-        if (env->ExceptionCheck()) {
-            LOGD(
-                    "JNI APPS: Exception while loading EntryPointApps, clearing and aborting injection"
-            );
-
-            env->ExceptionClear();
-
-            env->DeleteLocalRef(clClass);
-            env->DeleteLocalRef(systemClassLoader);
-            env->DeleteLocalRef(dexClClass);
-            env->DeleteLocalRef(buffer);
-            env->DeleteLocalRef(dexCl);
-            env->DeleteLocalRef(entryClassName);
-
-            return;
-        }
-
-        if (entryClassObj == nullptr) {
-            LOGD(
-                    "JNI APPS: loadClass('EntryPointApps') returned null, aborting injection"
-            );
-
-            env->DeleteLocalRef(clClass);
-            env->DeleteLocalRef(systemClassLoader);
-            env->DeleteLocalRef(dexClClass);
-            env->DeleteLocalRef(buffer);
-            env->DeleteLocalRef(dexCl);
-            env->DeleteLocalRef(entryClassName);
-
-            return;
-        }
-
-        auto entryClass =
-                (jclass) entryClassObj;
-
-        JNINativeMethod methods[] = {
-            {
-                "setFieldNative",
-                "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V",
-                (void *) setFieldNative
-            }
-        };
-
-        const jint registerResult = env->RegisterNatives(
-                entryClass,
-                methods,
-                1
-        );
-        if (checkJniException(env, "APPS RegisterNatives") || registerResult != JNI_OK) {
-            LOGD("JNI APPS: native method registration failed; skipping injection");
-            return;
-        }
+        jclass entryClass = loadEntryClass(ENTRY_CLASS_APPS, "APPS");
+        if (entryClass == nullptr) return;
 
         LOGD("JNI APPS: Calling EntryPointApps.init");
 
-        auto entryInit =
-                env->GetStaticMethodID(
-                        entryClass,
-                        "init",
-                        "(ILjava/lang/String;)V"
-                );
-        if (checkJniException(env, "APPS EntryPoint.init lookup") || entryInit == nullptr) return;
+        jmethodID init = env->GetStaticMethodID(entryClass, "init", "(ILjava/lang/String;)V");
+        if (checkJniException(env, "APPS init lookup") || init == nullptr) return;
 
-        auto javaStr =
-                env->NewStringUTF(
-                        appJson.dump().c_str()
-                );
-        if (checkJniException(env, "APPS JSON allocation") || javaStr == nullptr) return;
+        jstring javaJson = env->NewStringUTF(appJson.dump().c_str());
+        if (checkJniException(env, "APPS JSON allocation") || javaJson == nullptr) return;
 
-        env->CallStaticVoidMethod(
-                entryClass,
-                entryInit,
-                verboseLogs,
-                javaStr
-        );
-        checkJniException(env, "APPS EntryPoint.init call");
-
-        env->DeleteLocalRef(javaStr);
-
-        env->DeleteLocalRef(clClass);
-        env->DeleteLocalRef(systemClassLoader);
-        env->DeleteLocalRef(dexClClass);
-        env->DeleteLocalRef(buffer);
-        env->DeleteLocalRef(dexCl);
-        env->DeleteLocalRef(entryClassName);
-        env->DeleteLocalRef(entryClassObj);
+        env->CallStaticVoidMethod(entryClass, init, verboseLogs, javaJson);
+        checkJniException(env, "APPS init call");
     }
 };
+
+// ---------------------------------------------------------------------------
+// Companion (runs as root, outside the app process)
+// ---------------------------------------------------------------------------
+
+// Profiles are cached for the life of the companion, but reloaded when the file changes.
+class CachedFile {
+public:
+    bool load(const char *path, std::vector<char> &out, size_t maxSize) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        struct stat st {};
+        if (stat(path, &st) != 0) {
+            LOGD("Companion: cannot stat %s; errno=%d (%s)", path, errno, strerror(errno));
+            ready_ = false;
+            return false;
+        }
+
+        if (!ready_ || st.st_mtim.tv_sec != mtimeSec_ || st.st_mtim.tv_nsec != mtimeNsec_ ||
+            st.st_size != size_) {
+            if (!readFile(path, data_, maxSize)) {
+                LOGD("Companion: cannot read %s", path);
+                ready_ = false;
+                return false;
+            }
+            mtimeSec_ = st.st_mtim.tv_sec;
+            mtimeNsec_ = st.st_mtim.tv_nsec;
+            size_ = st.st_size;
+            ready_ = true;
+            LOGD("Companion: loaded %s (%d bytes)", path, static_cast<int>(data_.size()));
+        }
+
+        out = data_;
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<char> data_;
+    bool ready_ = false;
+    time_t mtimeSec_ = 0;
+    long mtimeNsec_ = 0;
+    off_t size_ = 0;
+};
+
+static CachedFile appProfileCache;
+static CachedFile photosProfileCache;
 
 static void companion(int fd) {
     std::vector<char> dexVector;
@@ -1826,67 +1160,42 @@ static void companion(int fd) {
     std::vector<char> appProfileVector;
     std::vector<char> photosConfigVector;
 
-    auto loadPath = [](const char *path, std::vector<char> &buffer, size_t maxSize) -> bool {
-        FILE *file = fopen(path, "rb");
-        if (file == nullptr) return false;
-        const bool ok = readFileIntoVector(file, buffer, maxSize);
-        fclose(file);
-        if (!ok) buffer.clear();
-        return ok;
-    };
-
-    if (!loadPath(DEX_FILE_PATH, dexVector, MAX_DEX_PAYLOAD) || dexVector.empty()) {
+    if (!readFile(DEX_FILE_PATH, dexVector, MAX_DEX_PAYLOAD) || dexVector.empty()) {
         LOGD("Companion: failed to read a valid dex payload");
         dexVector.clear();
     }
 
+    static constexpr const char *configPaths[] = {
+        CUSTOM_PROP_FILE_PATH, CUSTOM_JSON_FILE_PATH, PROP_FILE_PATH, JSON_FILE_PATH,
+    };
     const char *configSource = nullptr;
-    bool configLoaded = loadPath(CUSTOM_PROP_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
-    if (configLoaded) configSource = CUSTOM_PROP_FILE_PATH;
-    if (!configLoaded) {
-        configLoaded = loadPath(CUSTOM_JSON_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
-        if (configLoaded) configSource = CUSTOM_JSON_FILE_PATH;
+    for (const char *path : configPaths) {
+        if (readFile(path, configVector, MAX_CONFIG_PAYLOAD)) {
+            configSource = path;
+            break;
+        }
     }
-    if (!configLoaded) {
-        configLoaded = loadPath(PROP_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
-        if (configLoaded) configSource = PROP_FILE_PATH;
-    }
-    if (!configLoaded) {
-        configLoaded = loadPath(JSON_FILE_PATH, configVector, MAX_CONFIG_PAYLOAD);
-        if (configLoaded) configSource = JSON_FILE_PATH;
-    }
-    LOGD("Companion config source: %s; loaded=%d; bytes=%d",
-         configSource ? configSource : "none", configLoaded ? 1 : 0,
+    LOGD("Companion config source: %s; bytes=%d", configSource != nullptr ? configSource : "none",
          static_cast<int>(configVector.size()));
 
-    if (!loadCachedProfile(APP_PROFILE_FILE_PATH, appProfileCache,
-                           appProfileCacheReady, appProfileVector,
-                           MAX_APP_PROFILE_PAYLOAD)) {
+    if (!appProfileCache.load(APP_PROFILE_FILE_PATH, appProfileVector, MAX_APP_PROFILE_PAYLOAD))
         appProfileVector.clear();
-        LOGD("Companion: couldn't load app profile: %s", APP_PROFILE_FILE_PATH);
-    }
 
-    const bool photosConfigLoaded = loadCachedProfile(
-            PHOTOS_PROP_FILE_PATH, photosProfileCache, photosProfileCacheReady,
-            photosConfigVector, MAX_CONFIG_PAYLOAD);
-    if (!photosConfigLoaded) {
+    if (!photosProfileCache.load(PHOTOS_PROP_FILE_PATH, photosConfigVector, MAX_CONFIG_PAYLOAD))
         photosConfigVector.clear();
-        LOGD("Companion: couldn't load Photos profile: %s", PHOTOS_PROP_FILE_PATH);
-    }
 
-    const long dexSize = static_cast<long>(dexVector.size());
-    const long configSize = static_cast<long>(configVector.size());
-    const long appProfileSize = static_cast<long>(appProfileVector.size());
-    const long photosConfigSize = static_cast<long>(photosConfigVector.size());
+    const PayloadHeader header{
+        static_cast<int64_t>(dexVector.size()),
+        static_cast<int64_t>(configVector.size()),
+        static_cast<int64_t>(appProfileVector.size()),
+        static_cast<int64_t>(photosConfigVector.size()),
+    };
 
-    const bool sent = writeFully(fd, &dexSize, sizeof(dexSize)) &&
-                      writeFully(fd, &configSize, sizeof(configSize)) &&
-                      writeFully(fd, &appProfileSize, sizeof(appProfileSize)) &&
-                      writeFully(fd, &photosConfigSize, sizeof(photosConfigSize)) &&
+    const bool sent = writeFully(fd, &header, sizeof(header)) &&
                       writeFully(fd, dexVector.data(), dexVector.size()) &&
                       writeFully(fd, configVector.data(), configVector.size()) &&
                       writeFully(fd, appProfileVector.data(), appProfileVector.size()) &&
-                      (photosConfigSize == 0 || writeFully(fd, photosConfigVector.data(), photosConfigVector.size()));
+                      writeFully(fd, photosConfigVector.data(), photosConfigVector.size());
 
     if (!sent) LOGD("Companion: failed to send complete payload to Zygisk process");
 }
