@@ -770,15 +770,15 @@ h1 .material-icons{
 
 <script>
 const PROP_CANDIDATES = [
- "/data/adb/modules/playintegrityfix/custom.pif.prop",
- "/data/adb/custom.pif.prop"
+ "/data/adb/modules/integrity-box/config.meow",
+ "/data/adb/config.meow"
 ];
 
 const KEYS = ["spoofBuild","spoofProps","spoofProvider","spoofSignature","spoofVendingFinger","spoofVendingSdk","spoofPatch","spoofPixel"];
-const ZYGISK_PATH = "/data/adb/modules/playintegrityfix/zygisk";
+const ZYGISK_PATH = "/data/adb/modules/integrity-box/zygisk";
 const FLAG_DIR = "/data/adb/Box-Brain/PIF";
 const STOP_FLAG = "/data/adb/Box-Brain/PIF/stop";
-const ZYGISK_SCRIPT = "/data/adb/modules/playintegrityfix/webroot/common_scripts/zygisk.sh";
+const ZYGISK_SCRIPT = "/data/adb/modules/integrity-box/webroot/common_scripts/zygisk.sh";
 
 const behaviourFlags = [
  {id:"advanced",icon:"tune",title:"Advanced Mode",label:"behaviour",desc:"Enabling this will preserve spoofing settings otherwise they'll be reset automatically when you run action. Please do not disable this toggle."},

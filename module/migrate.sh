@@ -15,7 +15,7 @@ N="
 case "$1" in
 -h|--help|help) echo "sh migrate.sh [-f] [-o] [-a] [in-file] [out-file]"; exit 0;;
 -i|--install|install) INSTALL=1; shift;;
-*) echo "custom.pif.prop migration script \
+*) echo "config.meow migration script \
   $N  by osm0sis @ xda-developers $N";;
 esac;
 
@@ -88,12 +88,12 @@ fi;
 DIR=$(dirname "$(readlink -f "$DIR")");
 
 if [ -z "$FILE" ]; then
-[ -f "$DIR/custom.pif.prop" ] && FILE="$DIR/custom.pif.prop";
+[ -f "$DIR/config.meow" ] && FILE="$DIR/config.meow";
 fi;
 [ -f "$FILE" ] || die "No config file found";
 
 OUT="$2";
-[ -z "$OUT" ] && OUT="$DIR/custom.pif.prop";
+[ -z "$OUT" ] && OUT="$DIR/config.meow";
 
 # Preserve existing date comments from input file
 RELEASED_ON=""
@@ -335,7 +335,7 @@ for SETTING in spoofApps spoofBuild spoofProps spoofProvider spoofSignature spoo
   eval "$SETTING=\$VALUE";
 done;
 
-[ "$INSTALL" ] || item " ✦ Writing fields and properties to updated custom.pif.prop ...";
+[ "$INSTALL" ] || item " ✦ Writing fields and properties to updated config.meow ...";
 [ "$ADVANCED" ] && item " ✦ Adding Advanced Settings entries ...";
 
 CMNT='#'

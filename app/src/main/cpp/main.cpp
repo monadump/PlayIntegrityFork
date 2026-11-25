@@ -32,11 +32,11 @@
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF/Native", __VA_ARGS__)
 
-#define MODULE_DIR "/data/adb/modules/playintegrityfix/"
+#define MODULE_DIR "/data/adb/modules/integrity-box/"
 
 #define DEX_FILE_PATH MODULE_DIR "classes.dex"
 #define PROP_FILE_PATH MODULE_DIR "pif.prop"
-#define CUSTOM_PROP_FILE_PATH MODULE_DIR "custom.pif.prop"
+#define CUSTOM_PROP_FILE_PATH MODULE_DIR "config.meow"
 #define JSON_FILE_PATH MODULE_DIR "pif.json"
 #define CUSTOM_JSON_FILE_PATH MODULE_DIR "custom.pif.json"
 #define APPS_FILE_PATH MODULE_DIR "apps.txt"
