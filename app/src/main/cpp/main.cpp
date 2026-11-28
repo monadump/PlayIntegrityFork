@@ -606,9 +606,23 @@ public:
         isTargetApp = !pkgName.empty() && isPackageInAppsList(pkgName);
 
         if (!isDroidGuardOrVending && !isTargetApp && !isPhotos) {
+            // Secondary Google Play Services processes are skipped on purpose; say so once per
+            // process so the main/DroidGuard/other-GMS split is visible in a capture.
+            if (pkgName.rfind("com.google.android.gms", 0) == 0) {
+                LOGD("ZYGISK: pid=%d uid=%d pkg=%s proc=%s: not a target, unloading",
+                     static_cast<int>(getpid()), static_cast<int>(args->uid),
+                     pkgName.c_str(), processName.c_str());
+            }
             unload();
             return;
         }
+
+        LOGD("ZYGISK: pid=%d uid=%d pkg=%s proc=%s role=%s",
+             static_cast<int>(getpid()), static_cast<int>(args->uid),
+             pkgName.c_str(), processName.c_str(),
+             processName == DROIDGUARD_PACKAGE ? "droidguard" :
+             pkgName == VENDING_PACKAGE ? "vending" :
+             isTargetApp ? "app" : "photos");
 
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
 
@@ -897,8 +911,15 @@ private:
     void spoofSystem() {
         LOGD("Resume state: Continuing injection for %s", pkgName.c_str());
 
-        if (spoofProps > 0 && !installVirtualizer(jsonProps, json, true))
-            doHook();
+        if (spoofProps > 0) {
+            if (installVirtualizer(jsonProps, json, true)) {
+                LOGD("Property-area virtualization installed in %s", processName.c_str());
+            } else {
+                LOGD("Property-area virtualization failed in %s; falling back to property hook",
+                     processName.c_str());
+                doHook();
+            }
+        }
 
         if (spoofBuild + spoofProvider + spoofSignature +
             spoofVendingFinger + spoofVendingSdk + spoofPatch + spoofPixel > 0) {
